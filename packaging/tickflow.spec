@@ -32,6 +32,7 @@ ROOT = Path(SPECPATH).parent
 FRONTEND_DIST = str(ROOT / "frontend" / "dist")
 TIERS_YAML = str(ROOT / "tiers.yaml")
 BUILTIN_STRATEGIES = str(ROOT / "backend" / "app" / "strategy" / "builtin")
+TDX_MCP_PLUGIN = str(ROOT / "backend" / "app" / "plugins" / "tdx_mcp")
 # 图标按平台选: Windows 用 .ico, macOS 用 .icns (PyInstaller 对 .ico 在
 # mac 上静默忽略, 不换格式 Dock/Finder 会显示通用图标)。两者都由
 # packaging/generate_icon.py 一并生成。
@@ -48,6 +49,15 @@ for pkg in ("polars", "pyarrow", "duckdb", "fastexcel"):
     datas += d
     binaries += b
     hiddenimports += h
+
+# tdx-mcp 是通过 plugin.yaml 字符串动态导入的，PyInstaller 无法沿普通 import
+# 链发现。桌面版把其 eltdx TCP 客户端、动态模块和清单一并固化，避免运行时尝试
+# 对 frozen exe 执行 pip/uv 安装。
+tdx_d, tdx_b, tdx_h = collect_all("eltdx")
+datas += tdx_d
+binaries += tdx_b
+hiddenimports += tdx_h
+hiddenimports += collect_submodules("app.plugins.tdx_mcp")
 
 # Polars 的发行包名为 polars-runtime-32 / polars-runtime-compat, 但实际
 # Python 导入包带前导下划线。release.yml 安装 legacy-cpu 后必须收集二者，
@@ -104,7 +114,7 @@ for pkg in (
     "tickflow",  # tickflow/__version__.py 用 importlib.metadata 读版本
     "uvicorn", "polars", "duckdb", "pyarrow", "httpx", "numpy", "pandas",
     "openai", "platformdirs", "winotify", "plyer", "apscheduler",
-    "python-dotenv", "fastexcel",
+    "python-dotenv", "fastexcel", "eltdx",
 ):
     datas += _safe_metadata(pkg)
 
@@ -115,6 +125,9 @@ datas += [(FRONTEND_DIST, "static")]
 datas += [(TIERS_YAML, ".")]
 # 内置策略 → app/strategy/builtin/ (importlib 动态加载, 不能进 PYZ)
 datas += [(BUILTIN_STRATEGIES, "app/strategy/builtin")]
+# TDX Provider 的 loader 依赖磁盘 plugin.yaml 扫描；保留完整目录也让 frozen 状态
+# 诊断仍能读取 requirements.txt 和插件说明。
+datas += [(TDX_MCP_PLUGIN, "app/plugins/tdx_mcp")]
 
 # ── 排除不需要的重型依赖 (主包不含 vectorbt 回测链) ──────────────────
 excludes = [

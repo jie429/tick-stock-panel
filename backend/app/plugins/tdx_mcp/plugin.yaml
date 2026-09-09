@@ -1,0 +1,11 @@
+# tdx-mcp 的项目内 Provider: 不启动 stdio MCP 进程, 直接用其底层 eltdx TCP 客户端。
+name: tdx_mcp
+display_name: "tdx-mcp (免费 TCP)"
+runtime: python
+entry: app.plugins.tdx_mcp.provider:TdxMcpProvider
+check: app.plugins.tdx_mcp.bridge:availability
+datasets: [daily, adj_factor, minute, realtime, depth5]
+fallback_to_tickflow_on_error: false
+description: "免费通达信 TCP: 原始日K、股票/ETF除权事件因子、按标的/分组1分钟K、全市场分批实时快照、五档盘口(缺档保留空值)。实时行情按代码表每批最多80只轮询，最低30秒；分钟仅供应商当前保留窗口内的单标的数据（约90个交易日），不提供盘中全市场分钟增量或历史财务报表。"
+install_hint: "点击安装 eltdx 依赖后即可使用; 无需 API Key。"
+homepage: "https://github.com/Neoooo0909/tdx-mcp"

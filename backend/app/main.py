@@ -387,6 +387,11 @@ async def _application_lifespan(app: FastAPI):
         mrs = getattr(app.state, "minute_refresh", None)
         if mrs:
             mrs.stop()
+        try:
+            from app.data_providers import custom as custom_sources
+            custom_sources.close_all()
+        except Exception as e:
+            logger.warning("custom data sources shutdown failed: %s", e)
         logger.info("shutdown")
 
 

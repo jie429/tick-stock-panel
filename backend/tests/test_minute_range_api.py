@@ -101,8 +101,80 @@ def test_sync_minute_single_uses_requested_days(monkeypatch):
     ))
 
     assert result["rows"] == 2400
-    sync.assert_called_once_with(["600000.SH"], repo, capset, days=10, force_full_days=True)
+    sync.assert_called_once_with(
+        ["600000.SH"], repo, capset, days=10, force_full_days=True, asset_type="stock",
+    )
     refresh.assert_called_once_with(repo, "kline_minute")
+
+
+def test_sync_minute_single_persists_etf_to_etf_store(monkeypatch):
+    repo = MagicMock()
+    repo.resolve_asset_type.return_value = "etf"
+    capset = MagicMock()
+    sync = MagicMock(return_value=2400)
+    refresh = MagicMock()
+    monkeypatch.setattr(kline_api, "_minute_allowed", lambda _: True)
+    monkeypatch.setattr(kline_api.kline_sync, "sync_and_persist_minute", sync)
+    monkeypatch.setattr("app.jobs.daily_pipeline._refresh_single_view", refresh)
+
+    result = asyncio.run(kline_api.sync_minute_single(
+        _request(repo, capset),
+        {"symbol": "510300.SH", "days": 10},
+    ))
+
+    assert result["rows"] == 2400
+    sync.assert_called_once_with(
+        ["510300.SH"], repo, capset, days=10, force_full_days=True, asset_type="etf",
+    )
+    refresh.assert_called_once_with(repo, "kline_etf_minute")
+
+
+def test_sync_minute_single_maps_source_isolated_failure_to_502(monkeypatch):
+    repo = MagicMock()
+    repo.resolve_asset_type.return_value = "stock"
+    monkeypatch.setattr(kline_api, "_minute_allowed", lambda _: True)
+    monkeypatch.setattr(
+        kline_api.kline_sync,
+        "sync_and_persist_minute",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(kline_api.kline_sync.MinuteProviderError("TDX TCP down")),
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        asyncio.run(kline_api.sync_minute_single(
+            _request(repo, MagicMock()),
+            {"symbol": "600000.SH"},
+        ))
+
+    assert exc_info.value.status_code == 502
+    assert "分钟数据源拉取失败" in str(exc_info.value.detail)
+
+
+def test_clear_minute_removes_stock_and_etf_stores(monkeypatch, tmp_path):
+    repo = MagicMock()
+    repo.store.data_dir = tmp_path
+    repo.execute_one.side_effect = lambda sql: (3,) if "kline_minute" in sql and "etf" not in sql else (2,)
+    request = _request(repo, MagicMock())
+    request.method = "POST"
+
+    async def _json():
+        return {"confirm": True}
+
+    request.json = _json
+    (tmp_path / "kline_minute").mkdir()
+    (tmp_path / "kline_etf_minute").mkdir()
+    refresh = MagicMock()
+    monkeypatch.setattr("app.jobs.daily_pipeline._refresh_single_view", refresh)
+    monkeypatch.setattr("app.api.data.invalidate_storage_cache", lambda: None)
+
+    result = asyncio.run(kline_api.clear_minute(request))
+
+    assert result == {"status": "ok", "removed": 5}
+    assert not (tmp_path / "kline_minute").exists()
+    assert not (tmp_path / "kline_etf_minute").exists()
+    assert refresh.call_args_list == [
+        ((repo, "kline_minute"), {}),
+        ((repo, "kline_etf_minute"), {}),
+    ]
 
 
 def test_sync_minute_single_rejects_invalid_days():

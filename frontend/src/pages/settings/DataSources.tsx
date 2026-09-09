@@ -605,21 +605,13 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
 
   const selectedCustom = customList.find(s => s.name === selected)
 
-  // ===== 各能力当前的有效提供方 (除权 same_as_daily = 跟随日K) =====
-  // 用于能力芯片"服务中"态与详情卡标识: 路由切换在上方能力路由区, 这里只读展示
-  const dailyPref = prefs.data?.daily_data_provider || 'tickflow'
-  const adjPref = prefs.data?.adj_factor_provider || 'same_as_daily'
-  const effProvider: Record<string, string> = {
-    daily: dailyPref,
-    adj_factor: adjPref === 'same_as_daily' ? dailyPref : adjPref,
-    minute: prefs.data?.minute_data_provider || 'tickflow',
-    full_minute: prefs.data?.full_minute_data_provider || 'tickflow',
-    realtime: prefs.data?.realtime_data_provider || 'tickflow',
-    depth5: prefs.data?.depth5_data_provider || 'tickflow',
-    financial: prefs.data?.financial_data_provider || 'tickflow',
+  // 只有能力矩阵确认当前有效且可用的路由，才显示为"服务中"。
+  // 这避免依赖丢失后的插件虽保留在偏好中，却被误标成正常服务。
+  const servingDatasets = (name: string) => {
+    return (matrix.data?.capabilities ?? [])
+      .filter(cap => cap.effective === name && cap.usable)
+      .map(cap => cap.id)
   }
-  const servingDatasets = (name: string) =>
-    Object.entries(effProvider).filter(([, v]) => v === name).map(([k]) => k)
   const servingSetOf = (name: string) => new Set(servingDatasets(name))
 
   const matrixCaps = matrix.data?.capabilities ?? []
@@ -667,6 +659,7 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
         adj_factor_provider: pick('adj_factor'),
         realtime_data_provider: pick('realtime'),
         minute_data_provider: pick('minute'),
+        depth5_data_provider: pick('depth5'),
         financial_data_provider: pick('financial'),
       })
     },
@@ -769,6 +762,7 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
             const isSelected = selected === item.name
             const plugin = pluginMap.get(item.name)
             const pluginUnavailable = plugin && !plugin.available
+            const dependencyManaged = plugin?.dependency_managed === true
             const installing = installMut.isPending && installMut.variables === item.name
             const uninstalling = uninstallMut.isPending && uninstallMut.variables === item.name
             const declared = new Set(item.datasets)
@@ -825,12 +819,14 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
                     {servingCount > 0
                       ? `服务中 ${servingCount} 项能力`
                       : pluginUnavailable
-                        ? (plugin?.runtime === 'none' ? '点击配置 Key' : (plugin?.install_hint || plugin?.status || ''))
-                        : ''}
+                        ? (dependencyManaged
+                          ? (plugin?.status || '桌面版不支持运行时安装插件依赖')
+                          : (plugin?.runtime === 'none' ? '点击配置 Key' : (plugin?.install_hint || plugin?.status || '')))
+                        : dependencyManaged ? '依赖由桌面安装包管理' : ''}
                   </span>
                   <div className="flex items-center gap-1 shrink-0">
                     {pluginUnavailable ? (
-                      plugin?.runtime !== 'none' && (
+                      plugin?.runtime !== 'none' && !dependencyManaged && (
                         installing ? (
                           <span className="inline-flex items-center gap-1 text-[10px] text-accent">
                             <RefreshCw className="h-2.5 w-2.5 animate-spin" /> 安装中...
@@ -854,7 +850,7 @@ export function SettingsDataSourcesPanel({ highlight }: { highlight?: string } =
                         >
                           套用
                         </button>
-                        {plugin && plugin?.runtime !== 'none' && (
+                        {plugin && plugin?.runtime !== 'none' && !dependencyManaged && (
                           uninstalling ? (
                             <RefreshCw className="h-2.5 w-2.5 animate-spin text-muted" />
                           ) : (
@@ -1017,6 +1013,9 @@ function PluginDetail({ plugin, isActive, matrixCaps, servingSet }: {
           <div className="flex items-center gap-2 mb-1 flex-wrap">
             <h3 className="text-base font-semibold text-foreground">{plugin.display_name}</h3>
             <span className="text-[10px] text-muted/50 uppercase tracking-wider">插件 · {plugin.runtime}</span>
+            {plugin.dependency_managed && (
+              <span className="rounded bg-accent/10 px-1 py-0.5 text-[9px] font-medium leading-none text-accent">桌面版管理</span>
+            )}
             <span className="rounded bg-warning/15 px-1 py-0.5 text-[9px] font-medium leading-none text-warning">第三方</span>
             {isActive && (
               <span className="inline-flex items-center gap-1 text-[10px] text-accent bg-accent/10 px-2 py-1 rounded">

@@ -22,8 +22,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 
 from app.config import settings
 from app.indicators.pipeline import filter_halt_days, run_pipeline
-from app.services import index_sync, instrument_sync, kline_sync
-from app.services import preferences as _prefs
+from app.market_time import cn_now, cn_today
+from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import DEMO_SYMBOLS, get_pool
 from app.tickflow.repository import KlineRepository
@@ -146,7 +146,9 @@ def _resolve_universe(capset: CapabilitySet, repo=None) -> list[str]:
     repo 传入时过滤自选兜底里的指数 symbol (指数日K走独立 kline_index_* 存储,
     进股票池会污染 kline_daily/kline_minute)。ETF 刻意保留 (既有行为)。
     """
-    if capset.has(Cap.KLINE_DAILY_BATCH):
+    # 自定义日K源获得的 batch capability 不等于 TickFlow 的全市场 universe
+    # 权限; 选中 Provider 时优先使用刚同步到本地的基础维表, 避免隐式直连 TickFlow。
+    if capset.has(Cap.KLINE_DAILY_BATCH) and _prefs.get_daily_data_provider() == "tickflow":
         try:
             all_a = get_pool("CN_Equity_A", refresh=True)
             if all_a:
@@ -227,9 +229,25 @@ def run_now(
     #   无任何数据 → batch K-line API 拉首次 1 年
     from datetime import date as _date, timedelta as _td, datetime as _dt
     latest_daily = repo.latest_daily_date()
-    today = _date.today()
+    today = cn_today()
     today_exists = latest_daily and latest_daily >= today
     new_daily_days = 0
+    daily_failures: list[str] = []
+
+    def _daily_completion_message(written: int, normal_message: str) -> str:
+        """记录批量日K的部分失败, 避免任务和进度误报完整成功。"""
+        if not daily_failures:
+            return normal_message
+        failed_symbols = list(dict.fromkeys(daily_failures))
+        sample = ", ".join(failed_symbols[:5])
+        stage_errors.append(
+            f"daily sync: {len(failed_symbols)} 只标的拉取失败 (样例: {sample})",
+        )
+        logger.warning(
+            "sync_daily: partial failure, wrote %d rows; %d symbols not updated (sample: %s)",
+            written, len(failed_symbols), sample,
+        )
+        return f"日K部分失败, 已写入 {written} 行, {len(failed_symbols)} 只标的未更新"
 
     # 完整性自愈: 检测最近交易日的盘中快照/缺口 (盘中停机后次日开实时会留下
     # 中午快照, 而下方"今天已有数据→只刷今天"分支会让它永久留存)。
@@ -280,11 +298,13 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failures,
         )
         gap_days = (today - start_date).days
         new_daily_days = gap_days
-        emit("sync_daily", 45, f"日K 完成,覆盖 {gap_days} 天")
-        logger.info("sync_daily: [%s ~ %s] done, %d days", start_date, today, gap_days)
+        emit("sync_daily", 45, _daily_completion_message(written_daily, f"日K 完成,覆盖 {gap_days} 天"))
+        if not daily_failures:
+            logger.info("sync_daily: [%s ~ %s] done, %d days", start_date, today, gap_days)
     elif (
         today_exists
         and stale_day is None
@@ -321,11 +341,13 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failures,
         )
         gap_days = (today - start_date).days
         new_daily_days = gap_days
-        emit("sync_daily", 45, f"日K 完成,覆盖 {gap_days} 天")
-        logger.info("sync_daily: [%s ~ %s] done, %d days", start_date, today, gap_days)
+        emit("sync_daily", 45, _daily_completion_message(written_daily, f"日K 完成,覆盖 {gap_days} 天"))
+        if not daily_failures:
+            logger.info("sync_daily: [%s ~ %s] done, %d days", start_date, today, gap_days)
     else:
         # 首次：无任何数据 → batch 拉 1 年
         start_date = today - _td(days=365)
@@ -341,10 +363,12 @@ def run_now(
             start_date=_dt.combine(start_date, _dt.min.time()),
             end_date=_dt.combine(today, _dt.min.time()),
             on_chunk_done=_daily_chunk_progress,
+            failed_out=daily_failures,
         )
         new_daily_days = 365
-        emit("sync_daily", 45, "日K 完成")
-        logger.info("sync_daily: [%s ~ %s] done", start_date, today)
+        emit("sync_daily", 45, _daily_completion_message(written_daily, "日K 完成"))
+        if not daily_failures:
+            logger.info("sync_daily: [%s ~ %s] done", start_date, today)
     _invalidate("daily")
 
     # 完整性修复时删除股票 enriched 的坏分区: 增量重算只算 enriched 里不存在
@@ -389,7 +413,7 @@ def run_now(
     can_sync_adj = capset.has(Cap.ADJ_FACTOR) or adj_provider != "tickflow"
     if can_sync_adj:
         from datetime import datetime, timedelta
-        adj_end = datetime.now()
+        adj_end = cn_now()
         if daily_range_start is not None:
             adj_start = datetime.combine(daily_range_start, datetime.min.time())
         else:
@@ -517,6 +541,27 @@ def run_now(
     index_count = 0
     etf_count = 0
     etf_adj_symbols = 0
+    index_daily_failures: list[str] = []
+    etf_daily_failures: list[str] = []
+
+    def _asset_daily_completion_message(
+        label: str,
+        written: int,
+        failures: list[str],
+        error_prefix: str,
+    ) -> str:
+        if not failures:
+            return f"{label}日K完成,{written} 行"
+        failed_symbols = list(dict.fromkeys(failures))
+        sample = ", ".join(failed_symbols[:5])
+        stage_errors.append(
+            f"{error_prefix}: {len(failed_symbols)} 只标的拉取失败 (样例: {sample})",
+        )
+        logger.warning(
+            "%s: partial failure, wrote %d rows; %d symbols not updated (sample: %s)",
+            error_prefix, written, len(failed_symbols), sample,
+        )
+        return f"{label}日K部分失败, 已写入 {written} 行, {len(failed_symbols)} 只标的未更新"
     pull_index = _prefs.get_pipeline_pull_index()
     pull_etf = _prefs.get_pipeline_pull_etf()
 
@@ -558,8 +603,15 @@ def run_now(
                     start_date=_dt.combine(index_start, _dt.min.time()),
                     end_date=_dt.combine(today, _dt.min.time()),
                     on_chunk_done=_index_chunk,
+                    failed_out=index_daily_failures,
                 )
-                emit("sync_index", 88, f"指数日K完成,{written_index_daily} 行")
+                emit(
+                    "sync_index",
+                    88,
+                    _asset_daily_completion_message(
+                        "指数", written_index_daily, index_daily_failures, "index daily sync",
+                    ),
+                )
                 _invalidate("index_instruments")
                 _invalidate("index_daily")
                 _invalidate("index_enriched")
@@ -576,7 +628,7 @@ def run_now(
                     try:
                         emit("sync_index", 88, "同步 ETF 除权因子…")
                         from datetime import datetime, timedelta
-                        adj_end = datetime.now()
+                        adj_end = cn_now()
                         adj_path = repo.store.data_dir / "adj_factor_etf" / "all.parquet"
                         fallback_start = adj_end - timedelta(days=30)
                         adj_start = fallback_start
@@ -621,8 +673,15 @@ def run_now(
                     start_date=_dt.combine(etf_start, _dt.min.time()),
                     end_date=_dt.combine(today, _dt.min.time()),
                     on_chunk_done=_etf_chunk,
+                    failed_out=etf_daily_failures,
                 )
-                emit("sync_index", 88, f"ETF 日K完成,{written_etf_daily} 行")
+                emit(
+                    "sync_index",
+                    88,
+                    _asset_daily_completion_message(
+                        "ETF ", written_etf_daily, etf_daily_failures, "ETF daily sync",
+                    ),
+                )
                 _invalidate("etf_instruments")
                 _invalidate("etf_daily")
 
@@ -645,7 +704,10 @@ def run_now(
     minute_on = preferences.get_minute_sync_enabled()
     minute_days = preferences.get_minute_sync_days()
     written_minute = 0
-    if minute_on and capset.has(Cap.KLINE_MINUTE_BATCH):
+    if (
+        minute_on
+        and kline_sync.minute_universe_sync_allowed(capset)
+    ):
         minute_start = today - _td(days=minute_days)
         emit("sync_minute", 90, f"获取分钟K [{minute_start} ~ {today}]…")
         logger.info("sync_minute: [%s ~ %s] start", minute_start, today)
@@ -657,6 +719,7 @@ def run_now(
         written_minute = kline_sync.sync_and_persist_minute(
             minute_symbols, repo, capset, days=minute_days,
             on_chunk_done=_minute_chunk_progress,
+            universe_sync=True,
         )
         minute_dir = repo.store.data_dir / "kline_minute"
         minute_cover_days = len(list(minute_dir.glob("date=*"))) if minute_dir.exists() else 0
@@ -666,7 +729,7 @@ def run_now(
     else:
         skipped.append("sync_minute")
         if minute_on:
-            logger.info("sync_minute skipped: no KLINE_MINUTE_BATCH capability")
+            logger.info("sync_minute skipped: no full-market minute capability for current provider")
         else:
             logger.info("sync_minute skipped: user disabled")
 

@@ -29,6 +29,10 @@ from app.tickflow.repository import KlineRepository, replace_with_retry
 logger = logging.getLogger(__name__)
 
 
+class MinuteProviderError(RuntimeError):
+    """选定且来源隔离的分钟 Provider 在需落库的请求中失败。"""
+
+
 def _atomic_write_parquet(df: pl.DataFrame, out) -> None:
     """先写临时文件再原子替换, 避免进程中断留下损坏的 parquet。
 
@@ -92,6 +96,38 @@ def _normalize_daily(df_in, default_symbol: str | None = None) -> pl.DataFrame:
     return df.select(keep)
 
 
+def _resolve_daily_provider(asset_type: AssetType | str) -> object | None:
+    """解析当前日K源; 未声明该资产类型时保留既有 TickFlow 路由。
+
+    ``datasets`` 是数据集级声明, 不能据此假设所有 Provider 都覆盖指数/ETF。
+    兼容旧 Provider: 未声明 ``daily_asset_types`` 时只视为支持股票。
+    """
+    provider_name = preferences.get_daily_data_provider()
+    if provider_name == "tickflow":
+        return None
+
+    from app.data_providers import custom as custom_sources
+
+    try:
+        if not custom_sources.provider_has_dataset(provider_name, "daily"):
+            if custom_sources.plugin_requires_source_isolation(provider_name):
+                raise RuntimeError("插件当前不可用或未完成加载")
+            return None
+        provider = custom_sources.get_provider(provider_name)
+    except Exception as exc:
+        raise RuntimeError(f"日K Provider {provider_name} 解析失败: {exc}") from exc
+
+    declared = getattr(provider, "daily_asset_types", {"stock"})
+    try:
+        supported = {str(value).lower() for value in declared}
+    except TypeError:
+        logger.warning("日K Provider %s 的 daily_asset_types 非迭代值, 按仅股票处理", provider_name)
+        supported = {"stock"}
+    if str(asset_type).lower() not in supported:
+        return None
+    return provider
+
+
 def sync_daily_batch(symbols: list[str],
                      count: int | None = None,
                      batch_size: int | None = None,
@@ -99,6 +135,7 @@ def sync_daily_batch(symbols: list[str],
                      start_time: datetime | None = None,
                      end_time: datetime | None = None,
                      on_chunk_done: Callable[[int, int], None] | None = None,
+                     asset_type: AssetType | str = "stock",
                      failed_out: list[str] | None = None) -> pl.DataFrame:
     """批量拉取多股日 K。
 
@@ -108,6 +145,25 @@ def sync_daily_batch(symbols: list[str],
     failed_out: 可选出参。拉取失败的分块标的会追加进该 list, 供上层判定「部分失败」
                 而非静默当成功(某分块断网 → 这些标的本轮未更新, 保持旧数据)。
     """
+    provider = _resolve_daily_provider(asset_type)
+    if provider is not None:
+        # sync_daily_batch 的 ``count`` 语义是回溯固定窗口; 不要让 TDX 在常规页面
+        # 请求中因空起止时间变成单标的全历史拉取。
+        provider_end = end_time
+        provider_start = start_time
+        if provider_start is None and provider_end is None:
+            provider_end = cn_now()
+            provider_start = provider_end - timedelta(days=count or 250)
+        kwargs = {
+            "start_time": provider_start,
+            "end_time": provider_end,
+            "asset_type": asset_type,
+            "on_chunk_done": on_chunk_done,
+        }
+        if failed_out is not None and getattr(provider, "supports_daily_failure_reporting", False):
+            kwargs["failed_out"] = failed_out
+        return provider.get_daily(symbols, **kwargs)
+
     tf = get_client()
     out: list[pl.DataFrame] = []
     chunks = chunked(symbols, batch_size)
@@ -164,6 +220,8 @@ def sync_and_persist_daily_batch(
     start_date: datetime | None = None,
     end_date: datetime | None = None,
     on_chunk_done: Callable[[int, int], None] | None = None,
+    asset_type: AssetType | str = "stock",
+    failed_out: list[str] | None = None,
 ) -> int:
     """批量同步日 K 并落到 Parquet。返回写入的行数。
 
@@ -173,70 +231,40 @@ def sync_and_persist_daily_batch(
     if not symbols:
         return 0
 
-    provider_name = preferences.get_daily_data_provider()
-    if provider_name != "tickflow":
-        from app.data_providers import custom as custom_sources
-        if custom_sources.provider_has_dataset(provider_name, "daily"):
-            provider = custom_sources.get_provider(provider_name)
-            end_time = end_date or datetime.now()
-            days = count or 365
-            start_time = start_date or (end_time - timedelta(days=days))
-            iter_daily = getattr(provider, "iter_daily", None)
-            if callable(iter_daily):
-                return _persist_daily_chunks(
-                    iter_daily(
-                        symbols,
-                        start_time=start_time,
-                        end_time=end_time,
-                        on_chunk_done=on_chunk_done,
-                    ),
-                    repo,
-                )
-            df = provider.get_daily(
-                symbols,
-                start_time=start_time,
-                end_time=end_time,
-                on_chunk_done=on_chunk_done,
-            )
-            if df.is_empty():
-                return 0
-            repo.append_daily(df)
-            try:
-                d = repo.store.data_dir.as_posix()
-                repo.db.execute(
-                    f"""CREATE OR REPLACE VIEW kline_daily AS
-                        SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
-                )
-            except Exception as e:  # noqa: BLE001
-                logger.warning("refresh view failed: %s", e)
-            return df.height
-        # 自定义源未配置 daily → 回退 TickFlow
-
-    if not capset.has(Cap.KLINE_DAILY_BATCH):
+    provider = _resolve_daily_provider(asset_type)
+    if provider is None and not capset.has(Cap.KLINE_DAILY_BATCH):
         return 0
 
     limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH, default_batch=100)
 
-    end_time = end_date or datetime.now()
+    end_time = end_date or cn_now()
     start_time = start_date or (end_time - timedelta(days=365))
 
     df = sync_daily_batch(
         symbols, count=count, batch_size=limit.batch, rpm=limit.rpm,
         start_time=start_time, end_time=end_time,
         on_chunk_done=on_chunk_done,
+        asset_type=asset_type,
+        failed_out=failed_out,
     )
 
     if df.is_empty():
         return 0
 
-    repo.append_daily(df)
+    if asset_type == "stock":
+        repo.append_daily(df)
+    else:
+        repo.append_daily_asset(str(asset_type), df)
 
     try:
-        d = repo.store.data_dir.as_posix()
-        repo.db.execute(
-            f"""CREATE OR REPLACE VIEW kline_daily AS
-                SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
-        )
+        if asset_type == "stock":
+            d = repo.store.data_dir.as_posix()
+            repo.db.execute(
+                f"""CREATE OR REPLACE VIEW kline_daily AS
+                    SELECT * FROM read_parquet('{d}/kline_daily/**/*.parquet', union_by_name=true)"""
+            )
+        else:
+            repo.refresh_index_views()
     except Exception as e:  # noqa: BLE001
         logger.warning("refresh view failed: %s", e)
 
@@ -402,7 +430,14 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
     provider_name = preferences.get_adj_factor_provider()
     if provider_name != "tickflow":
         from app.data_providers import custom as custom_sources
-        if custom_sources.provider_has_dataset(provider_name, "adj_factor"):
+        try:
+            has_adj_factor = custom_sources.provider_has_dataset(provider_name, "adj_factor")
+        except Exception as exc:
+            if custom_sources.plugin_requires_source_isolation(provider_name):
+                raise RuntimeError(f"除权因子 Provider {provider_name} 当前不可用: {exc}") from exc
+            logger.warning("除权因子 Provider %s 解析失败, 回退 TickFlow: %s", provider_name, exc)
+            has_adj_factor = False
+        if has_adj_factor:
             provider = custom_sources.get_provider(provider_name)
             new_data = provider.get_adj_factors(
                 symbols,
@@ -427,6 +462,8 @@ def sync_adj_factor(symbols: list[str], repo: KlineRepository,
                 return merged.height - before, affected
             _atomic_write_parquet(new_data.sort(["symbol", "trade_date"]), out)
             return new_data.height, affected
+        if custom_sources.plugin_requires_source_isolation(provider_name):
+            raise RuntimeError(f"除权因子 Provider {provider_name} 当前不可用或未声明 adj_factor 能力")
         # 自定义源未配置 adj_factor → 回退 TickFlow
 
     if not capset.has(Cap.ADJ_FACTOR):
@@ -751,6 +788,47 @@ def _resolve_minute_provider(
         return (None, True, str(e))
 
 
+def minute_universe_sync_supported() -> bool:
+    """Whether the active minute provider supports full-market persistence.
+
+    ``KLINE_MINUTE_BATCH`` only covers per-symbol/group minute K-lines. New
+    providers can explicitly opt out with ``supports_minute_universe_sync=False``.
+    Legacy YAML providers lack this attribute and retain their original behavior.
+    """
+    provider_name = preferences.get_minute_data_provider()
+    if provider_name == "tickflow":
+        return True
+    provider, fallback, _error = _resolve_minute_provider(provider_name)
+    if fallback or provider is None:
+        return False
+    return bool(getattr(provider, "supports_minute_universe_sync", True))
+
+
+def minute_universe_sync_allowed(capset: CapabilitySet | None) -> bool:
+    """当前 capability 与分钟源组合是否允许全市场分钟同步。"""
+    if capset is None or not capset.has(Cap.KLINE_MINUTE_BATCH):
+        return False
+    return minute_universe_sync_supported()
+
+
+def _minute_provider_fallback_enabled(provider_name: str, provider: object | None = None) -> bool:
+    """是否允许分钟源异常时改走 TickFlow。
+
+    旧自定义源保持默认的 fallback 行为。内置 TCP 源可通过类属性或 plugin.yaml 的
+    ``fallback_to_tickflow_on_error: false`` 明确要求来源隔离; 后者覆盖 Provider
+    在重载期间暂时无法解析的场景。
+    """
+    if provider is not None:
+        return bool(getattr(provider, "fallback_to_tickflow_on_error", True))
+    try:
+        from app.data_providers import custom as custom_sources
+
+        return not custom_sources.plugin_requires_source_isolation(provider_name)
+    except Exception as exc:
+        logger.warning("minute provider %s fallback policy lookup failed: %s", provider_name, exc)
+        return True
+
+
 def _try_custom_minute(
     symbols: list[str],
     start_time: datetime | None,
@@ -758,6 +836,8 @@ def _try_custom_minute(
     asset_type: AssetType,
     freq: str = "1m",
     on_chunk_done: Callable[[int, int, str], None] | None = None,
+    raise_on_source_error: bool = False,
+    failed_out: list[str] | None = None,
 ) -> tuple[pl.DataFrame | None, bool]:
     """尝试从自定义分钟源拉取。返回 (df, should_fallback_to_tickflow)。
 
@@ -765,8 +845,12 @@ def _try_custom_minute(
       (None, True)   → 未配自定义源 / 未配 minute dataset / 自定义源异常 → 走 TickFlow
       (df, False)    → 自定义源成功(含空 df) → 直接用, 不回退
 
-    自定义源异常时返回 fallback=True。单股拉取调用方另行检查 TickFlow 原生
-    能力, 避免自定义源增广能力误放行无权限请求。
+    ``raise_on_source_error`` 仅由落库同步使用。来源隔离 Provider 失效时, 读分时
+    仍可返回空帧以保持页面的 ``source=none`` 契约; 写入请求则必须显式失败, 不能把
+    TCP 故障伪装成“同步 0 行成功”。
+
+    其他自定义源异常时回退 TickFlow；单股调用方仍检查 TickFlow 原生能力，避免
+    由自定义源增广的能力误放行无权限请求。
 
     resolver 异常边界由 _resolve_minute_provider 统一兜底; 业务调用
     (provider.get_minute) 仍在本函数 try 块内, 与 resolver 异常分离
@@ -782,6 +866,15 @@ def _try_custom_minute(
         if err is not None:
             logger.warning("custom minute provider %s resolution failed, falling back to TickFlow: %s",
                            provider_name, err)
+        if not _minute_provider_fallback_enabled(provider_name):
+            logger.warning(
+                "custom minute provider %s unavailable; source isolation forbids TickFlow fallback",
+                provider_name,
+            )
+            if raise_on_source_error:
+                detail = err or "插件未加载或未声明 minute 能力"
+                raise MinuteProviderError(f"分钟K Provider {provider_name} 当前不可用: {detail}")
+            return (pl.DataFrame(), False)
         return (None, True)
 
     # 包装 on_chunk_done: provider 调 2 参 → 补 seg_label="custom" → 转发上层 3 参
@@ -792,20 +885,47 @@ def _try_custom_minute(
         wrapped_cb = _wrapped_cb
 
     try:
-        df = provider.get_minute(
-            symbols, start_time=start_time, end_time=end_time,
-            asset_type=asset_type, freq=freq, on_chunk_done=wrapped_cb,
-        )
+        kwargs = {
+            "start_time": start_time,
+            "end_time": end_time,
+            "asset_type": asset_type,
+            "freq": freq,
+            "on_chunk_done": wrapped_cb,
+        }
+        # ``failed_out`` 是后加的可选 Provider 契约; 仅显式声明支持的实现收到它,
+        # 保留历史 YAML/第三方 Provider 的旧方法签名。
+        if (
+            failed_out is not None
+            and getattr(provider, "supports_minute_failure_reporting", False) is True
+        ):
+            kwargs["failed_out"] = failed_out
+        df = provider.get_minute(symbols, **kwargs)
     except Exception as e:
-        logger.warning("custom minute provider %s call failed, falling back to TickFlow: %s",
-                       provider_name, e)
+        if not _minute_provider_fallback_enabled(provider_name, provider):
+            logger.warning(
+                "custom minute provider %s call failed; source isolation forbids TickFlow fallback: %s",
+                provider_name,
+                e,
+            )
+            if raise_on_source_error:
+                raise MinuteProviderError(f"分钟K Provider {provider_name} 拉取失败: {e}") from e
+            return (pl.DataFrame(), False)
+        logger.warning("custom minute provider %s call failed, falling back to TickFlow: %s", provider_name, e)
         return (None, True)
     try:
         # 时区契约守卫: 插件/自定义源帧同样收口为北京墙钟 (CONTRIBUTING §3.3)
         df = _enforce_minute_beijing_wallclock(df, source=provider_name)
     except Exception as e:
-        logger.warning("custom minute provider %s datetime 契约校验失败, falling back to TickFlow: %s",
-                       provider_name, e)
+        if not _minute_provider_fallback_enabled(provider_name, provider):
+            logger.warning(
+                "custom minute provider %s datetime contract failed; source isolation forbids TickFlow fallback: %s",
+                provider_name,
+                e,
+            )
+            if raise_on_source_error:
+                raise MinuteProviderError(f"分钟K Provider {provider_name} 时间契约失败: {e}") from e
+            return (pl.DataFrame(), False)
+        logger.warning("custom minute provider %s datetime 契约校验失败, falling back to TickFlow: %s", provider_name, e)
         return (None, True)
     return (df, False)
 
@@ -821,6 +941,8 @@ def sync_minute_batch(
     segment_trading_days: int = 20,
     on_segment: Callable[[pl.DataFrame], None] | None = None,
     asset_type: AssetType = "stock",
+    raise_on_source_error: bool = False,
+    failed_out: list[str] | None = None,
 ) -> pl.DataFrame:
     """批量拉取多股分钟 K。
 
@@ -841,6 +963,8 @@ def sync_minute_batch(
     df, fallback = _try_custom_minute(
         symbols, start_time=start_time, end_time=end_time,
         asset_type=asset_type, freq="1m", on_chunk_done=on_chunk_done,
+        raise_on_source_error=raise_on_source_error,
+        failed_out=failed_out,
     )
     if not fallback:
         # 自定义源成功: 遵守与 TickFlow 路径一致的 on_segment 契约。
@@ -933,6 +1057,17 @@ def intraday_monitor_support(capset: CapabilitySet | None) -> dict[str, object]:
         return {
             "available": True, "source": "custom_minute", "max_symbols": 100,
             "reason": "使用已配置的分钟数据插件",
+        }
+    if not _minute_provider_fallback_enabled(provider_name):
+        if error is not None:
+            logger.warning(
+                "minute provider %s resolution failed; source isolation disables intraday fallback: %s",
+                provider_name,
+                error,
+            )
+        return {
+            "available": False, "source": None, "max_symbols": 0,
+            "reason": "当前分钟数据源不可用, 且已禁止切换到其他来源",
         }
     if error is not None:
         logger.warning("minute provider resolution failed while checking monitor support: %s", error)
@@ -1266,12 +1401,34 @@ def fetch_minute_single(
     return _normalize_minute(_compact_klines_to_df(raw, default_symbol=symbol))
 
 
-def fetch_adj_factor_single(symbol: str) -> pl.DataFrame:
-    """从 TickFlow 实时拉取单股除权因子(不写入本地), 用于单股 K 线即时前复权。
+def fetch_adj_factor_single(
+    symbol: str,
+    start_time: datetime | None = None,
+    end_time: datetime | None = None,
+    asset_type: AssetType = "stock",
+) -> pl.DataFrame:
+    """拉取单股除权因子(不写本地), 遵守当前 Provider 路由。
 
-    返回结构: symbol, trade_date, ex_factor (空 DataFrame 表示无除权事件或拉取失败)。
-    与 _apply_adj_factor / compute_enriched 的 factors 参数格式一致。
+    返回结构: symbol, trade_date, ex_factor。来源隔离的 Provider 不可用时显式抛错,
+    避免单股日K即时前复权悄悄混入 TickFlow 数据。
     """
+    provider_name = preferences.get_adj_factor_provider()
+    if provider_name != "tickflow":
+        from app.data_providers import custom as custom_sources
+
+        try:
+            if custom_sources.provider_has_dataset(provider_name, "adj_factor"):
+                provider = custom_sources.get_provider(provider_name)
+                return provider.get_adj_factors(
+                    [symbol], start_time=start_time, end_time=end_time, asset_type=asset_type,
+                )
+        except Exception as exc:
+            if custom_sources.plugin_requires_source_isolation(provider_name):
+                raise RuntimeError(f"除权因子 Provider {provider_name} 拉取失败: {exc}") from exc
+            logger.warning("fetch_adj_factor_single(%s) custom provider failed: %s", symbol, exc)
+        if custom_sources.plugin_requires_source_isolation(provider_name):
+            raise RuntimeError(f"除权因子 Provider {provider_name} 当前不可用或未声明 adj_factor 能力")
+
     tf = get_client()
     try:
         raw = tf.klines.ex_factors([symbol], as_dataframe=False, show_progress=False)
@@ -1290,10 +1447,18 @@ def _as_beijing(d: datetime) -> datetime:
     return d if d.tzinfo is not None else d.replace(tzinfo=CN_TZ)
 
 
-def _latest_minute_datetime(repo: KlineRepository) -> datetime | None:
-    """本地分钟 K 数据的最新时间 (北京时区)。"""
+def _minute_table(asset_type: AssetType | str) -> str:
+    return "kline_etf_minute" if asset_type == "etf" else "kline_minute"
+
+
+def _latest_minute_datetime(
+    repo: KlineRepository,
+    asset_type: AssetType | str = "stock",
+) -> datetime | None:
+    """本地指定资产分钟 K 数据的最新时间 (北京时区)。"""
+    table = _minute_table(asset_type)
     try:
-        res = repo.execute_one("SELECT max(datetime) FROM kline_minute")
+        res = repo.execute_one(f"SELECT max(datetime) FROM {table}")
         if res and res[0]:
             d = res[0]
             if isinstance(d, datetime):
@@ -1304,10 +1469,14 @@ def _latest_minute_datetime(repo: KlineRepository) -> datetime | None:
     return None
 
 
-def _earliest_minute_datetime(repo: KlineRepository) -> datetime | None:
-    """本地分钟 K 数据的最早时间 (北京时区, 用于向前扩展的起点)。"""
+def _earliest_minute_datetime(
+    repo: KlineRepository,
+    asset_type: AssetType | str = "stock",
+) -> datetime | None:
+    """本地指定资产分钟 K 数据的最早时间 (北京时区, 用于向前扩展)。"""
+    table = _minute_table(asset_type)
     try:
-        res = repo.execute_one("SELECT min(datetime) FROM kline_minute")
+        res = repo.execute_one(f"SELECT min(datetime) FROM {table}")
         if res and res[0]:
             d = res[0]
             if isinstance(d, datetime):
@@ -1318,14 +1487,18 @@ def _earliest_minute_datetime(repo: KlineRepository) -> datetime | None:
     return None
 
 
-def _cleanup_null_datetime_minute(repo: KlineRepository) -> None:
-    """检测并清除 datetime 全为 null 的旧版分钟 K 数据(迁移用)。"""
-    minute_dir = repo.store.data_dir / "kline_minute"
+def _cleanup_null_datetime_minute(
+    repo: KlineRepository,
+    asset_type: AssetType | str = "stock",
+) -> None:
+    """检测并清除指定资产 datetime 全为 null 的旧版分钟 K 数据(迁移用)。"""
+    table = _minute_table(asset_type)
+    minute_dir = repo.store.data_dir / table
     if not minute_dir.exists():
         return
     try:
         row = repo.execute_one(
-            "SELECT count(*) AS total, count(datetime) AS non_null FROM kline_minute"
+            f"SELECT count(*) AS total, count(datetime) AS non_null FROM {table}"
         )
         if row and row[0] > 0 and (row[1] is None or row[1] == 0):
             # 全部 datetime 为 null — 清除所有分钟 K parquet
@@ -1338,9 +1511,12 @@ def _cleanup_null_datetime_minute(repo: KlineRepository) -> None:
         logger.debug("minute cleanup check failed: %s", e)
 
 
-def _migrate_symbol_to_date_partition(repo: KlineRepository) -> None:
-    """将旧版 symbol= 分区迁移为 date= 分区。迁移完成后删除旧目录。"""
-    minute_dir = repo.store.data_dir / "kline_minute"
+def _migrate_symbol_to_date_partition(
+    repo: KlineRepository,
+    asset_type: AssetType | str = "stock",
+) -> None:
+    """将指定资产旧版 symbol= 分区迁移为 date= 分区。"""
+    minute_dir = repo.store.data_dir / _minute_table(asset_type)
     if not minute_dir.exists():
         return
 
@@ -1406,13 +1582,20 @@ def sync_and_persist_minute(
     on_chunk_done: Callable[[int, int, str], None] | None = None,
     extend_backward: bool = False,
     force_full_days: bool = False,
+    universe_sync: bool = False,
+    asset_type: AssetType = "stock",
 ) -> int:
     """同步分钟 K 并存到 Parquet(前复权价格, SDK 端 adjust=qfq)。返回写入行数。
 
     使用 start_time / end_time 区间拉取, 确保所有标的覆盖同一时间段。
     on_chunk_done(current, total) 每个 chunk 完成后回调。
     force_full_days=True 时强制回溯 days 自然日 (不增量补, 用于个股补齐历史)。
+    universe_sync=True 仅供全市场入口调用; 按标的/分组请求保持 False。
     """
+    if asset_type not in {"stock", "etf"}:
+        raise ValueError(f"分钟K落库不支持资产类型: {asset_type}")
+    if universe_sync and not minute_universe_sync_allowed(capset):
+        raise PermissionError("当前分钟数据源不支持全市场分钟同步")
     minute_provider = preferences.get_minute_data_provider()
     # resolver 调用统一走 _resolve_minute_provider, 与 _try_custom_minute 共用异常边界。
     # resolver 异常时视为非 custom (minute_is_custom=False), 走 capset 检查 →
@@ -1424,15 +1607,18 @@ def sync_and_persist_minute(
                        minute_provider, resolve_err)
     if not symbols:
         return 0
+    if fallback and not _minute_provider_fallback_enabled(minute_provider):
+        detail = resolve_err or "插件未加载或未声明 minute 能力"
+        raise MinuteProviderError(f"分钟K Provider {minute_provider} 当前不可用: {detail}")
     if not minute_is_custom and not capset.has(Cap.KLINE_MINUTE_BATCH):
         return 0
 
     # 迁移:旧版 _normalize_minute 未转换 timestamp→datetime,导致全部 datetime 为 null
     # 检测到后直接清除(这些数据无法使用)
-    _cleanup_null_datetime_minute(repo)
+    _cleanup_null_datetime_minute(repo, asset_type)
 
     # 迁移:旧版按 symbol= 分区转为 date= 分区
-    _migrate_symbol_to_date_partition(repo)
+    _migrate_symbol_to_date_partition(repo, asset_type)
 
     # 窗口两端统一为北京时区: 起止点会与本地分钟 K 的北京墙钟混用, 用服务器
     # 本地时间会让窗口整体错位 (UTC 容器上起点晚于终点, 增量补拉一个请求都发不出)。
@@ -1440,7 +1626,7 @@ def sync_and_persist_minute(
 
     if extend_backward:
         # 向前扩展模式: 从本地最早数据往前补, 叠加已有数据避免缺口。
-        earliest_dt = _earliest_minute_datetime(repo)
+        earliest_dt = _earliest_minute_datetime(repo, asset_type)
         # 按交易日换算自然日 (7/5 系数)。>41 交易日时 +10 天余量覆盖节假日。
         # (分段由 sync_minute_batch 的 segment_trading_days 控制, 与此处的区间天数独立。)
         calendar_days = int(days * 7 / 5) + (10 if days > 41 else 0)
@@ -1454,7 +1640,7 @@ def sync_and_persist_minute(
     else:
         # 默认增量模式: 首次拉取回溯 N 天, 已有数据则从最新时间增量补到今天
         # force_full_days=True: 强制回溯 days 自然日 (个股补齐历史, 不增量)
-        last_dt = _latest_minute_datetime(repo)
+        last_dt = _latest_minute_datetime(repo, asset_type)
         if force_full_days:
             # 按交易日换算自然日 (7/5 系数), 确保覆盖足够交易日
             calendar_days = int(days * 7 / 5) + 5
@@ -1475,8 +1661,10 @@ def sync_and_persist_minute(
 
     # 流式落盘: 每段拉完立即写盘, 内存峰值 = 单段 (而非全量)。
     # 全量攒内存曾导致 1 年全市场分钟 K OOM 卡死 (3 亿行 / 数十 GB)。
-    minute_dir = repo.store.data_dir / "kline_minute"
+    minute_table = _minute_table(asset_type)
+    minute_dir = repo.store.data_dir / minute_table
     written_box = [0]  # list 闭包, 绕过 Python 闭包外层赋值
+    failed_symbols: list[str] = []
 
     def _persist(seg_df: pl.DataFrame) -> None:
         # 单股自动补齐可能与另一个补齐请求同时写同一日期分区。Windows 不允许
@@ -1491,22 +1679,30 @@ def sync_and_persist_minute(
         on_chunk_done=on_chunk_done,
         segment_trading_days=segment_days,
         on_segment=_persist,
-        asset_type="stock",
+        asset_type=asset_type,
+        raise_on_source_error=True,
+        failed_out=failed_symbols,
     )
 
-    if written_box[0] == 0:
-        return 0
     written = written_box[0]
+    if written:
+        # 部分失败前已经落盘的成功标的也要刷新视图; 随后抛错使调用方不会把本轮当成功。
+        try:
+            d = repo.store.data_dir.as_posix()
+            repo.db.execute(
+                f"""CREATE OR REPLACE VIEW {minute_table} AS
+                    SELECT * FROM read_parquet('{d}/{minute_table}/**/*.parquet', union_by_name=true)"""
+            )
+        except Exception as e:
+            logger.warning("refresh %s view failed: %s", minute_table, e)
 
-    # 刷新视图
-    try:
-        d = repo.store.data_dir.as_posix()
-        repo.db.execute(
-            f"""CREATE OR REPLACE VIEW kline_minute AS
-                SELECT * FROM read_parquet('{d}/kline_minute/**/*.parquet', union_by_name=true)"""
+    if failed_symbols:
+        sample = ", ".join(dict.fromkeys(failed_symbols[:5]))
+        raise MinuteProviderError(
+            f"分钟K部分拉取失败: {len(set(failed_symbols))} 只标的未更新 (样例: {sample})"
         )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("refresh kline_minute view failed: %s", e)
+    if written == 0:
+        return 0
 
-    logger.info("minute K synced: %d rows (%d symbols)", written, len(symbols))
+    logger.info("minute K synced: %d rows (%d %s symbols)", written, len(symbols), asset_type)
     return written

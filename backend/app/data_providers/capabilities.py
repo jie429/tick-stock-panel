@@ -3,8 +3,8 @@
 能力 (capability) = 一个标准化数据集 (CONTRIBUTING「数据源插件化要求」):
 daily / adj_factor / realtime / minute / depth5 / financial (注册表顺序即设置页卡片顺序)。注册表集中声明每个
 能力的展示元数据、路由偏好字段与 TickFlow 档位要求, 前端设置页不再各自硬编码。
-depth5 与其他数据集一样可由插件声明并独立路由; 五档不可用时连板梯队封单/
-看板封单通过 usable 给出缺数据提示。
+depth5 可由声明该数据集的内置 Provider 插件提供; YAML HTTP 自定义源仍不开放该
+契约。五档不可用时连板梯队封单/看板封单缺数据应有提示。
 
 build_capability_matrix 把注册表、插件/自定义源的能力声明 (datasets) 和当前
 路由偏好合并为一个矩阵, 供设置页一次拉全。当前偏好由 API 层注入
@@ -67,6 +67,7 @@ CAPABILITY_REGISTRY: list[dict] = [
         "field": "depth5_data_provider",
         "default": "tickflow",
         "tf_tier": "pro",
+        # 仅内置 Provider 插件可声明 depth5; YAML HTTP 自定义源白名单不开放该数据集。
     },
     {
         "id": "financial",
@@ -87,6 +88,18 @@ CAPABILITY_REGISTRY: list[dict] = [
         # (插件实现 get_intraday_batch / 可选 get_intraday_latest, YAML 仅修复轮)
     },
 ]
+
+
+def dataset_for_provider_preference(field: str) -> str | None:
+    """Return the standard dataset mapped to a data-provider preference field.
+
+    The capability registry is the single authority for the field-to-dataset
+    mapping used by settings validation and historical-preference compatibility.
+    """
+    for capability in CAPABILITY_REGISTRY:
+        if capability["field"] == field:
+            return str(capability["id"])
+    return None
 
 _TICKFLOW_CANDIDATE = {
     "name": "tickflow",

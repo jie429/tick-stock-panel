@@ -1655,6 +1655,8 @@ export interface PluginDataSourceItem {
   display_name: string
   datasets: string[]
   runtime: string          // node | python | none
+  /** 冻结桌面版的依赖由安装包管理，不能从界面安装或卸载。 */
+  dependency_managed?: boolean
   available: boolean       // 依赖是否已安装
   status: string           // 可用性原因 (供 UI 显示)
   description: string
@@ -1793,6 +1795,8 @@ export interface Preferences {
   full_minute_data_provider?: string
   /** 分钟源 1 分钟历史深度(交易日); null/缺省 = 深历史 (如 tickflow)。分时档位据此收窄 */
   minute_history_days?: number | null
+  /** 当前分钟源是否能执行全市场分钟落盘；按标的/分组源不等于该能力。 */
+  minute_universe_sync_supported?: boolean
   depth5_data_provider?: string
   realtime_data_provider?: string
   financial_data_provider?: string
@@ -2365,6 +2369,7 @@ export const api = {
   syncMinute: (days?: number, extend?: boolean) =>
     request<{ status: string; job_id: string }>('/api/kline/sync_minute', {
       method: 'POST',
+      quiet: true,
       body: JSON.stringify({ ...(days ? { days } : {}), ...(extend ? { extend: true } : {}) }),
     }),
   syncMinuteSingle: (symbol: string, days?: number) =>

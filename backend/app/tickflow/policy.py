@@ -305,7 +305,7 @@ def detect_capabilities(force: bool = False) -> CapabilitySet:
 
 # 数据集 → 能力映射: 第三方源声明某数据集且被选为当前 provider 时补授的能力。
 # 实时行情无对应能力键 (权限由 QuoteService.is_realtime_allowed 判定);
-# WebSocket 暂无第三方数据集契约, 不增广。
+# depth5 仅允许内置 Provider 插件声明, YAML HTTP 源仍不开放该契约。
 _DATASET_CAP_MAP: tuple[tuple[str, Cap], ...] = (
     ("daily", Cap.KLINE_DAILY_BATCH),
     ("adj_factor", Cap.ADJ_FACTOR),

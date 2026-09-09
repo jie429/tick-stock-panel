@@ -14,7 +14,8 @@ from datetime import datetime, timedelta
 import polars as pl
 
 from app.indicators.pipeline import compute_enriched
-from app.services import kline_sync, preferences
+from app.market_time import cn_now
+from app.services import instrument_sync, kline_sync, preferences
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
 from app.tickflow.rate_limits import chunked, min_batch, resolve_limit, sleep_between_batches
@@ -81,6 +82,35 @@ def _fetch_instruments_by_type(instrument_type: str, asset_type_label: str) -> p
     instrument_type: 'index' / 'etf'
     asset_type_label: 写入 instruments 表的 asset_type 标记('index' / 'etf')
     """
+    handled, provider_rows = instrument_sync.fetch_instruments_via_provider(asset_type_label)
+    if handled:
+        if not provider_rows:
+            return pl.DataFrame()
+        df = pl.DataFrame(provider_rows)
+        if df.is_empty() or "symbol" not in df.columns:
+            return pl.DataFrame()
+        name_expr = (
+            pl.coalesce([pl.col("name").cast(pl.Utf8), pl.col("symbol").cast(pl.Utf8)])
+            if "name" in df.columns
+            else pl.col("symbol").cast(pl.Utf8)
+        )
+        code_expr = (
+            pl.col("code").cast(pl.Utf8)
+            if "code" in df.columns
+            else pl.col("symbol").cast(pl.Utf8).str.split(".").list.first()
+        )
+        return (
+            df.filter(pl.col("symbol").is_not_null())
+            .select([
+                pl.col("symbol").cast(pl.Utf8),
+                name_expr.alias("name"),
+                code_expr.alias("code"),
+            ])
+            .with_columns(pl.lit(asset_type_label).alias("asset_type"))
+            .unique(subset=["symbol"], keep="last")
+            .sort("symbol")
+        )
+
     tf = get_client()
     rows: list[dict] = []
     for ex in _EXCHANGES:
@@ -135,8 +165,10 @@ def sync_index_instruments(
         if not etf_df.is_empty():
             etf_parts.append(etf_df)
 
-    # 2) 付费补充:Starter+ 用 get_by_universes 补指数(仅当开启指数拉取)
-    if pull_index:
+    # 2) 付费补充: 仅 TickFlow 作为当前日 K / 维表来源时, 才用
+    # get_by_universes 补指数。已选 TDX 等 Provider 时必须保持来源隔离, 不能
+    # 因本机仍有 TickFlow 权限而隐式混入另一来源的数据。
+    if pull_index and preferences.get_daily_data_provider() == "tickflow":
         capset = None
         try:
             from app.tickflow import policy
@@ -197,6 +229,7 @@ def sync_and_persist_index_daily(
     end_date: datetime | None = None,
     symbols_override: list[str] | None = None,
     on_chunk_done: Callable[[int, int], None] | None = None,
+    failed_out: list[str] | None = None,
 ) -> int:
     """同步指数/ETF 日K到独立 parquet,并计算 enriched。
 
@@ -224,7 +257,7 @@ def sync_and_persist_index_daily(
     limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH)
     batch_size = min_batch(preferences.get_index_daily_batch_size(), limit)
 
-    end_time = end_date or datetime.now()
+    end_time = end_date or cn_now()
     start_time = start_date or (end_time - timedelta(days=365))
 
     total_rows = 0
@@ -237,6 +270,8 @@ def sync_and_persist_index_daily(
             batch_size=None,
             start_time=start_time,
             end_time=end_time,
+            asset_type="index",
+            failed_out=failed_out,
         )
         if raw.is_empty():
             continue
@@ -293,6 +328,7 @@ def sync_and_persist_etf_daily(
     end_date: datetime | None = None,
     symbols_override: list[str] | None = None,
     on_chunk_done: Callable[[int, int], None] | None = None,
+    failed_out: list[str] | None = None,
 ) -> int:
     """同步 ETF 日K到独立 kline_etf_* parquet,并计算 ETF enriched。
     on_chunk_done(current, total) 每个批次完成后回调。
@@ -316,7 +352,7 @@ def sync_and_persist_etf_daily(
     limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH)
     batch_size = min_batch(preferences.get_index_daily_batch_size(), limit)
 
-    end_time = end_date or datetime.now()
+    end_time = end_date or cn_now()
     start_time = start_date or (end_time - timedelta(days=365))
 
     total_rows = 0
@@ -330,6 +366,8 @@ def sync_and_persist_etf_daily(
             batch_size=None,
             start_time=start_time,
             end_time=end_time,
+            asset_type="etf",
+            failed_out=failed_out,
         )
         if raw.is_empty():
             continue

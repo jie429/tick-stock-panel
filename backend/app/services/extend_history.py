@@ -18,8 +18,9 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
-from datetime import date, datetime, timedelta
+from datetime import datetime, timedelta
 
+from app.market_time import cn_today
 from app.services import kline_sync
 from app.services.pipeline_jobs import job_store
 from app.tickflow.capabilities import Cap, CapabilitySet
@@ -39,7 +40,10 @@ def _invalidate(table: str | None = None) -> None:
 
 def _resolve_universe(capset: CapabilitySet) -> list[str]:
     """解析标的池 — 与 daily_pipeline 独立的副本。"""
-    if capset.has(Cap.KLINE_DAILY_BATCH):
+    from app.services import preferences
+
+    # 自定义日K源的能力增广不能用于请求 TickFlow universe; 回退到已有维表/自选。
+    if capset.has(Cap.KLINE_DAILY_BATCH) and preferences.get_daily_data_provider() == "tickflow":
         try:
             from app.tickflow.pools import get_pool
             all_a = get_pool("CN_Equity_A", refresh=True)
@@ -115,7 +119,7 @@ def run_extend_history(
 
     # 0. 计算时间偏移
     offset = compute_offset(value, unit)
-    today = date.today()
+    today = cn_today()
 
     # 1. 获取当前最早日期
     emit("extend_history", 2, "检查当前数据范围…")

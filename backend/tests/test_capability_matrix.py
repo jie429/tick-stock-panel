@@ -203,23 +203,23 @@ def test_adj_factor_routes_independently(monkeypatch):
 
 
 def test_depth5_capability_semantics(monkeypatch):
-    """五档可独立路由到声明 depth5 的插件, 不受 TickFlow 档位限制。"""
+    """五档可由内置插件提供; YAML 自定义源仍不声明该数据集。"""
     _fake_sources(
         monkeypatch,
-        [{"name": "depth_src", "display_name": "Depth", "datasets": ["depth5"],
+        [{"name": "tdx_mcp", "display_name": "tdx-mcp", "datasets": ["depth5"],
           "available": True, "status": "ok"}],
     )
     # pro 档: TickFlow 进候选, 默认路由 tickflow → usable
     cap = _by_id(build_capability_matrix(dict(DEFAULT_CURRENT), tickflow_tier="pro"))["depth5"]
     assert cap["tf_available"] is True
-    assert [c["name"] for c in cap["candidates"]] == ["tickflow", "depth_src"]
+    assert [c["name"] for c in cap["candidates"]] == ["tickflow", "tdx_mcp"]
     assert cap["usable"] is True
-    # starter 档: TickFlow 不可供, 但显式路由到插件后仍可用
-    current = dict(DEFAULT_CURRENT, depth5_data_provider="depth_src")
-    cap = _by_id(build_capability_matrix(current, tickflow_tier="starter"))["depth5"]
+    # free 档: TickFlow 未解锁, 但已选 tdx-mcp 时仍可用。
+    cap = _by_id(build_capability_matrix(
+        dict(DEFAULT_CURRENT, depth5_data_provider="tdx_mcp"), tickflow_tier="free",
+    ))["depth5"]
     assert cap["tf_available"] is False
-    assert [c["name"] for c in cap["candidates"]] == ["depth_src"]
-    assert cap["effective"] == "depth_src"
+    assert [c["name"] for c in cap["candidates"]] == ["tdx_mcp"]
     assert cap["usable"] is True
 
 

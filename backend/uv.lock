@@ -450,6 +450,15 @@ wheels = [
 ]
 
 [[package]]
+name = "eltdx"
+version = "0.5.1"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/e2/fa/dc4787fbc60b9aac3c0c8111ea01f7553772e03aee4af4b4d35cb6ef188c/eltdx-0.5.1.tar.gz", hash = "sha256:fa2b08a75978914f694e6cb155b0d2380ff6131129a432c5a6301125a0d91f88", size = 98802, upload-time = "2026-05-12T00:37:22.56Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/52/23/cc071f42cc5afbe7412b176646f70f85148d3fadd44e4ea6280790c6431b/eltdx-0.5.1-py3-none-any.whl", hash = "sha256:cdf50638c01418085cb1192b1b42d00db0cc0e38614e71f60f56cb3e83c09ba5", size = 46906, upload-time = "2026-05-12T00:37:20.89Z" },
+]
+
+[[package]]
 name = "executing"
 version = "2.2.1"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -2548,6 +2557,8 @@ backtest = [
     { name = "vectorbt" },
 ]
 desktop = [
+    { name = "eltdx" },
+    { name = "packaging" },
     { name = "pywebview" },
 ]
 dev = [
@@ -2564,12 +2575,14 @@ legacy-cpu = [
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.10" },
     { name = "duckdb", specifier = ">=1.0" },
+    { name = "eltdx", marker = "extra == 'desktop'", specifier = ">=0.5.0,<1.0" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastexcel", specifier = ">=0.10" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "mypy", marker = "extra == 'dev'", specifier = ">=1.10" },
     { name = "numba", marker = "platform_machine != 'x86_64' or sys_platform != 'darwin'", specifier = ">=0.65.1" },
     { name = "openai", specifier = ">=1.40" },
+    { name = "packaging", marker = "extra == 'desktop'", specifier = ">=24" },
     { name = "pandas", specifier = ">=2.2" },
     { name = "pillow", specifier = ">=10.0" },
     { name = "platformdirs", specifier = ">=4.0" },

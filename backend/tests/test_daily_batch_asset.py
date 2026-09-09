@@ -16,9 +16,10 @@ def test_daily_batch_groups_index_symbols(repo, monkeypatch):
     from app.api import kline as kline_api
 
     calls = {"stock_batch": [], "index": []}
+    today = _dt.date(2026, 9, 4)
 
     def fake_stock_batch(symbols, start, end, columns=None):
-        calls["stock_batch"].append(list(symbols))
+        calls["stock_batch"].append((list(symbols), start, end))
         return pl.DataFrame()
 
     def fake_index_daily(symbol, start, end, columns=None):
@@ -32,11 +33,14 @@ def test_daily_batch_groups_index_symbols(repo, monkeypatch):
     monkeypatch.setattr(repo, "get_index_daily", fake_index_daily)
     monkeypatch.setattr(repo, "get_index_symbol_set", lambda: {"000001.SH"})
     monkeypatch.setattr(repo, "get_etf_symbol_set", lambda: set())
+    monkeypatch.setattr(kline_api, "cn_today", lambda: today)
 
     state = type("S", (), {"repo": repo})()
     req = type("R", (), {"app": type("A", (), {"state": state})()})()
 
     out = kline_api.get_daily_batch(req, {"symbols": ["600000.SH", "000001.SH"], "days": 12})
-    assert calls["stock_batch"] == [["600000.SH"]]
+    assert calls["stock_batch"] == [
+        (["600000.SH"], today - _dt.timedelta(days=24), today),
+    ]
     assert calls["index"] == ["000001.SH"]
     assert "000001.SH" in out["data"]

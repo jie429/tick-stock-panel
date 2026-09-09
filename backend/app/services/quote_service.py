@@ -25,6 +25,7 @@
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -488,12 +489,34 @@ class QuoteService:
         return cls.realtime_mode() != "none"
 
     @classmethod
+    def _custom_realtime_min_interval(cls, provider_name: str) -> float:
+        """读取插件声明的实时轮询下限; 旧/HTTP Provider 保留通用 1 秒。"""
+        try:
+            from app.data_providers import custom as custom_sources
+
+            if not custom_sources.provider_has_dataset(provider_name, "realtime"):
+                return cls.CUSTOM_PROVIDER_MIN_INTERVAL
+            value = float(
+                getattr(
+                    custom_sources.get_provider(provider_name),
+                    "realtime_min_interval",
+                    cls.CUSTOM_PROVIDER_MIN_INTERVAL,
+                ),
+            )
+            if math.isfinite(value) and value >= cls.CUSTOM_PROVIDER_MIN_INTERVAL:
+                return min(cls.MAX_INTERVAL, value)
+        except Exception as exc:
+            logger.debug("读取实时 Provider %s 的轮询下限失败: %s", provider_name, exc)
+        return cls.CUSTOM_PROVIDER_MIN_INTERVAL
+
+    @classmethod
     def _tier_min_interval(cls) -> float:
-        # 实时源路由到插件/自定义源时, TickFlow 档位限速不适用 (中立能力原则):
-        # 下限放宽到通用 1s, 默认/已保存间隔不变
+        # 实时源路由到插件/自定义源时, TickFlow 档位限速不适用; 但 TCP 等来源
+        # 可以按其协议吞吐声明更高下限, 避免把全市场分批轮询误设成高频请求。
         from app.services import preferences
-        if preferences.get_realtime_data_provider() != "tickflow":
-            return cls.CUSTOM_PROVIDER_MIN_INTERVAL
+        provider_name = preferences.get_realtime_data_provider()
+        if provider_name != "tickflow":
+            return cls._custom_realtime_min_interval(provider_name)
         tier = cls._current_tier()
         return cls.TIER_MIN_INTERVAL.get(tier, cls.DEFAULT_INTERVAL)
 
@@ -660,7 +683,12 @@ class QuoteService:
         provider_name = preferences.get_realtime_data_provider()
         if provider_name != "tickflow":
             from app.data_providers import custom as custom_sources
-            if custom_sources.provider_has_dataset(provider_name, "realtime"):
+            try:
+                has_realtime = custom_sources.provider_has_dataset(provider_name, "realtime")
+            except Exception as exc:
+                logger.warning("自定义实时行情 Provider %s 解析失败: %s", provider_name, exc)
+                has_realtime = False
+            if has_realtime:
                 try:
                     t0 = time.perf_counter()
                     now_ts = time.perf_counter()
@@ -699,6 +727,17 @@ class QuoteService:
                     now_ts=now_ts,
                     replace_index_cache=replace_index_cache,
                     final_boundary_ms=final_boundary_ms,
+                )
+                return
+            try:
+                source_isolated = custom_sources.plugin_requires_source_isolation(provider_name)
+            except Exception as exc:
+                logger.warning("实时行情 Provider %s 隔离策略检查失败: %s", provider_name, exc)
+                source_isolated = False
+            if source_isolated:
+                logger.warning(
+                    "实时行情 Provider %s 当前不可用, 来源隔离禁止回退 TickFlow",
+                    provider_name,
                 )
                 return
             # 自定义源未配置 realtime → 回退 TickFlow

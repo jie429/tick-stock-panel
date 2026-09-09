@@ -269,20 +269,46 @@ def _allowed_data_providers() -> set[str]:
         return set(_ALLOWED_DATA_PROVIDERS)
 
 
+def _selected_data_provider(key: str) -> str:
+    """Read a data-provider preference while preserving isolated plugin choices.
+
+    Unknown ordinary values retain the historic TickFlow fallback. A plugin such
+    as tdx_mcp that declares ``fallback_to_tickflow_on_error: false`` keeps its
+    selection during dependency failures or reload windows, so callers can fail
+    closed. This only applies to datasets actually declared by that plugin.
+    """
+    provider = str(load().get(key, "tickflow") or "tickflow").lower()
+    if provider in _allowed_data_providers():
+        return provider
+    try:
+        from app.data_providers import custom as custom_sources
+        from app.data_providers.capabilities import dataset_for_provider_preference
+
+        dataset = dataset_for_provider_preference(key)
+        manifest = custom_sources.plugin_manifest(provider)
+        if (
+            dataset is not None
+            and manifest is not None
+            and dataset in set(manifest.get("datasets") or [])
+            and custom_sources.plugin_requires_source_isolation(provider)
+        ):
+            return provider
+    except Exception as exc:
+        logger.warning("data provider %s isolation policy lookup failed: %s", provider, exc)
+    return "tickflow"
+
+
 def get_daily_data_provider() -> str:
-    provider = str(load().get("daily_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _selected_data_provider("daily_data_provider")
 
 
 def get_adj_factor_provider() -> str:
     # 「跟随日K」(same_as_daily) 特殊值已下线: 存量配置里的旧值按非法值回退 tickflow
-    provider = str(load().get("adj_factor_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _selected_data_provider("adj_factor_provider")
 
 
 def get_minute_data_provider() -> str:
-    provider = str(load().get("minute_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _selected_data_provider("minute_data_provider")
 
 
 def get_full_minute_data_provider() -> str:
@@ -291,18 +317,15 @@ def get_full_minute_data_provider() -> str:
 
 
 def get_depth5_data_provider() -> str:
-    provider = str(load().get("depth5_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _selected_data_provider("depth5_data_provider")
 
 
 def get_realtime_data_provider() -> str:
-    provider = str(load().get("realtime_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _selected_data_provider("realtime_data_provider")
 
 
 def get_financial_provider() -> str:
-    provider = str(load().get("financial_data_provider", "tickflow") or "tickflow").lower()
-    return provider if provider in _allowed_data_providers() else "tickflow"
+    return _selected_data_provider("financial_data_provider")
 
 
 # ===== 盘后管道拉取内容开关 (A股 / ETF / 指数 独立控制) =====

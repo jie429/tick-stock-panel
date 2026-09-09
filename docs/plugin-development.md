@@ -3,7 +3,9 @@
 数据源插件是可选的行情数据来源(fuyao、stock-sdk、akshare 等),作为独立模块放在
 `backend/app/plugins/` 下。services 层(kline_sync / quote_service / financial_sync)
 全部通过统一路由点分流:插件声明了某数据集就走插件,未声明自动回退 TickFlow。
-因此**一个合格的插件只需要正确实现契约,不需要改动任何 service / API 代码**;
+因此**日K、分钟K、实时、除权和财务等已接通的数据集**只需正确实现契约，无需改动
+service / API 代码；`depth5` 是内置 Provider 专属的盘口契约，新增该数据集时还需
+确认五档服务已具备对应路由与测试。
 反过来,插件也必须遵守内部数据契约(单位、代码格式、复权口径),框架不会替你转换。
 
 > 无代码接入(纯 HTTP YAML 配置)请看 [custom-data-source.md](./custom-data-source.md),
@@ -28,7 +30,7 @@ display_name: "我的数据源"                 # 设置页显示名
 runtime: none                            # 运行时类型: node | python | none
 entry: app.plugins.my_source.provider:MyProvider   # provider 类的导入路径
 check: app.plugins.my_source.bridge:availability   # 可用性检测函数(可选)
-datasets: [realtime]                     # 支持: daily/adj_factor/minute/realtime/depth5/financial
+datasets: [realtime]                     # 支持: daily/adj_factor/minute/full_minute/realtime/depth5/financial
 api_key_env: MY_SOURCE_API_KEY           # (可选)声明后设置页提供 Key 输入框
 hidden: false                            # (可选)true = 已加载但对设置页隐藏,不注册不展示
 description: "数据源描述"
@@ -130,6 +132,15 @@ services 层零改动即可路由。只实现已声明数据集对应的方法,�
 class MyProvider:
     name = "my_source"
     builtin = True  # 标记为内置(不可被用户编辑/删除)
+    # 可选: 未声明时只覆盖 stock 日K/维表; TDX 等可显式扩展至 index/etf。
+    daily_asset_types = frozenset({"stock"})
+    instrument_asset_types = frozenset({"stock"})
+    # 仅在 Provider 真正支持全市场分钟落盘时才能设为 True。
+    supports_minute_universe_sync = False
+    # 可选: 分钟K历史窗口(交易日); 未声明表示不主动收窄。
+    minute_history_days = 5
+    # 可选: False 表示请求或格式校验失败时保持来源隔离, 不切换 TickFlow。
+    fallback_to_tickflow_on_error = False
 
     def __init__(self):
         self.config = MyConfig()  # 需有 .datasets 属性(dict, key 是数据集名)
@@ -170,8 +181,9 @@ class MyProvider:
         强烈建议实现本方法, 否则指数行情冻结在本地日K兜底。失败返回 None,
         成功但无数据返回 []。"""
 
-    def get_depth_batch(self, symbols: list[str]) -> dict[str, dict]:
-        """(声明 depth5 时实现)五档盘口, 返回以 symbol 为键的标准盘口字典。"""
+    def get_depth5(self, symbols) -> dict:
+        """仅内置 Provider：{symbol: {ask_volumes, bid_volumes, timestamp(ms)}}。
+        缺档用 None，不得把缺失伪造成 0；调用失败必须返回 {}，不得切换 TickFlow。"""
 
     def get_financials(self, table, symbols, latest_only=False) -> pl.DataFrame:
         """财务数据(声明 financial 数据集时实现, table 见 financial_sync 调用)。"""
@@ -185,16 +197,14 @@ class MyProvider:
         返回 error 字段说明会回退 TickFlow。"""
 ```
 
-`get_depth_batch` 返回结构如下。价格和数量数组均按一档到五档排列;数量单位为“手”,
-`timestamp` 为毫秒 Unix 时间戳。服务层按 capability 的 `batch` / `rpm` 统一分片限速,
-provider 不应自行切换或回退到其他数据源。
+`get_depth5` 仅供内置 Provider 插件声明。它返回以 symbol 为键的标准盘口字典；数量数组按
+一档到五档排列，单位为“手”，`timestamp` 为毫秒 Unix 时间戳。服务层负责分片限速，provider
+不应自行切换或回退到其他数据源；YAML HTTP 自定义源不能声明 `depth5`。
 
 ```python
 {
     "600519.SH": {
-        "bid_prices": [1500.0, 1499.9, 1499.8, 1499.7, 1499.6],
         "bid_volumes": [10, 20, 30, 40, 50],
-        "ask_prices": [1500.1, 1500.2, 1500.3, 1500.4, 1500.5],
         "ask_volumes": [12, 22, 32, 42, 52],
         "timestamp": 1788505200000,
     },
@@ -239,14 +249,23 @@ provider 不应自行切换或回退到其他数据源。
 > `full_minute`。YAML 声明式源同样支持(数据集配置与 `minute` 同形,仅提供
 > 修复轮语义,见 [custom-data-source.md](./custom-data-source.md))。
 
+可选类属性 `daily_asset_types` 与 `instrument_asset_types` 分别声明日K和基础标的维表
+覆盖的资产类型。未声明时为兼容旧 Provider, 均按仅 `stock` 处理。`get_instruments()`
+仅应返回上游可可靠给出的字段; 如只有代码表, 不得伪造股本、涨跌停等金融元数据。
+
+`supports_minute_universe_sync` 默认应为 `False`。能按标的或分组拉取分钟K, 不等于能
+承受全市场分钟落盘；未明确声明时，全市场入口会拒绝该 Provider。若分钟源必须保持
+来源隔离，可设置 `fallback_to_tickflow_on_error = False`；请求失败或分钟时间契约校验
+失败时会返回空结果而不会隐式调用 TickFlow。
+
 ### 异常语义
 
 | 方法 | 失败行为 |
 | --- | --- |
 | `get_realtime` | **软失败**: 返回 `[]` + warning 日志, 保证轮询线程不中断 |
 | `get_realtime_indices` | **软失败**: 返回 `None` + warning 日志, 保留上轮有效缓存; 成功无数据返回 `[]` |
-| `get_depth_batch` | 单批异常由服务隔离并保留其他批次; 不跨数据源回退 |
-| `get_minute` | 抛异常时调用方自动回退 TickFlow 重试 |
+| `get_depth5` | 单批异常由服务隔离；不跨数据源回退 |
+| `get_minute` | 默认抛异常时调用方回退 TickFlow；设 `fallback_to_tickflow_on_error = False` 时 fail-closed |
 | `get_daily` / `get_adj_factors` / `get_financials` | 异常由上层同步流程捕获记录; 无数据返回空 DataFrame |
 | `iter_daily` | 可选; 每批必须符合 `get_daily` 契约。流正常结束后才提交 staging; 未捕获异常会丢弃 staging。provider 内已定义的单标的软失败语义保持不变 |
 
@@ -296,7 +315,7 @@ class MyConfig:
 插件 PR 必须带契约测试(CONTRIBUTING §9), **不依赖真实网络与 API Key**——用假
 Client/桥接注入。以 `backend/tests/test_fuyao_provider.py` 为范本, 至少覆盖:
 
-1. 字段映射与单位转换: 百分数→小数制、volume 股→手、*ms 零点戳时区换算、缺失字段按口径推导、缺失字段置 None 不伪造
+1. 字段映射与单位转换: 百分数→小数制、volume 股→手（已为手则原样）、*ms 零点戳时区换算、缺失字段按口径推导、缺失字段置 None 不伪造
 2. 接口响应结构变体: 实测结构 vs 官方文档示例双兼容(供应商文档与实际不一致是常态)
 3. 分页: 多页合并、空页终止、页数上限
 4. 软失败: 接口报错返回 []; 整页 schema 变化有告警而非静默空数据

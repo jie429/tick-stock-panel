@@ -7,6 +7,7 @@ import math
 import re
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 
 import yaml
@@ -34,6 +35,16 @@ _PLUGIN_STATUS: dict[str, dict] = {}
 _NAME_RE = re.compile(r"^[a-z0-9_]+$")
 
 
+def _is_frozen_runtime() -> bool:
+    """PyInstaller 等冻结运行时没有可写的 Python/Node 插件环境。"""
+    return bool(getattr(sys, "frozen", False))
+
+
+def _plugin_dependency_managed(runtime: str) -> bool:
+    """冻结桌面版的 Node/Python 依赖必须随安装包发布, 不能在进程内变更。"""
+    return _is_frozen_runtime() and runtime in {"node", "python"}
+
+
 def plugins_dir() -> Path:
     """内置可选插件目录 (app/plugins/, 与现有包结构一致, 开发态/容器态路径统一)。"""
     return Path(__file__).resolve().parents[2] / "plugins"
@@ -45,10 +56,8 @@ def data_sources_dir() -> Path:
 
 def load_all(path: Path | None = None) -> None:
     """Load all custom provider YAML files into process memory."""
-    global _PROVIDERS, _LOAD_ERRORS
-    for provider in _PROVIDERS.values():
-        provider.close()
-    _PROVIDERS = {}
+    global _LOAD_ERRORS
+    close_all()
     _LOAD_ERRORS = []
 
     base = path or data_sources_dir()
@@ -69,6 +78,24 @@ def load_all(path: Path | None = None) -> None:
 
     # 内置可选插件 (plugins/ 目录)。与用户 YAML 源独立, 缺依赖只记状态不报错。
     _load_builtin_plugins()
+
+
+def close_all() -> None:
+    """关闭当前注册的 Provider, 并清空注册表。
+
+    reload 与应用退出共用此入口。先摘除全局引用再逐个关闭, 避免任一关闭异常
+    打断后续 Provider 的资源回收; TDX 等带在途调用租约的 Provider 会自行延迟底层
+    client 的实际关闭。
+    """
+    global _PROVIDERS, _PLUGIN_STATUS
+    providers = list(_PROVIDERS.values())
+    _PROVIDERS = {}
+    _PLUGIN_STATUS = {}
+    for provider in providers:
+        try:
+            provider.close()
+        except Exception as exc:
+            logger.warning("custom data source close failed %s: %s", getattr(provider, "name", "?"), exc)
 
 
 def list_sources() -> list[dict]:
@@ -110,6 +137,23 @@ def plugin_manifest(name: str) -> dict | None:
     if not manifest_path.exists():
         return None
     return yaml.safe_load(manifest_path.read_text(encoding="utf-8")) or {}
+
+
+def plugin_requires_source_isolation(name: str) -> bool:
+    """内置插件是否要求故障时不得隐式改用 TickFlow。
+
+    该判断直接读取静态清单, 不依赖 Provider 是否已完成依赖检查/注册。因此在插件
+    重载窗口或依赖被卸载后, 仍能保留用户已选的来源并由业务路由明确 fail-closed。
+    """
+    normalized = str(name or "").lower()
+    if not _NAME_RE.fullmatch(normalized):
+        return False
+    try:
+        manifest = plugin_manifest(normalized)
+    except Exception as exc:
+        logger.warning("插件 %s 清单读取失败, 无法确认来源隔离策略: %s", normalized, exc)
+        return False
+    return bool(manifest and manifest.get("fallback_to_tickflow_on_error") is False)
 
 
 def plugin_dir_of(name: str) -> Path:
@@ -154,6 +198,8 @@ def install_plugin(name: str) -> tuple[bool, str]:
     if manifest is None:
         return False, f"插件 '{name}' 不存在或无 plugin.yaml"
     runtime = str(manifest.get("runtime", "none")).lower()
+    if _plugin_dependency_managed(runtime):
+        return False, "桌面版不支持运行时安装插件依赖, 请使用包含该插件的发行版"
     pdir = plugin_dir_of(name)
     if not pdir.exists():
         return False, f"插件目录不存在: {pdir}"
@@ -240,6 +286,8 @@ def uninstall_plugin(name: str) -> tuple[bool, str]:
     if manifest is None:
         return False, f"插件 '{name}' 不存在或无 plugin.yaml"
     runtime = str(manifest.get("runtime", "none")).lower()
+    if _plugin_dependency_managed(runtime):
+        return False, "桌面版插件依赖由安装包管理, 不能在运行时卸载"
     pdir = plugin_dir_of(name)
     if not pdir.exists():
         return False, f"插件目录不存在: {pdir}"
@@ -570,6 +618,7 @@ def _register_one_plugin(manifest: dict) -> None:
         "display_name": manifest.get("display_name", name),
         "datasets": list(manifest.get("datasets", []) or []),
         "runtime": runtime,
+        "dependency_managed": _plugin_dependency_managed(runtime),
         "available": available,
         "status": reason,
         "description": manifest.get("description", ""),

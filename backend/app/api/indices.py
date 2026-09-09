@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import logging
-from datetime import date, datetime, timedelta
+from datetime import date, timedelta
 from typing import Optional
 
 import polars as pl
 from fastapi import APIRouter, HTTPException, Query, Request
 
 from app.indicators.pipeline import compute_enriched
+from app.market_time import cn_now, cn_today
 from app.services import index_sync, kline_sync
 from app.tickflow.capabilities import Cap
 
@@ -38,7 +39,7 @@ def get_index_daily(
 ):
     """读取指数日 K。指数数据使用独立 kline_index_* parquet。"""
     repo = request.app.state.repo
-    end = date.fromisoformat(end_date) if end_date else date.today()
+    end = date.fromisoformat(end_date) if end_date else cn_today()
     start = date.fromisoformat(start_date) if start_date else end - timedelta(days=days)
     info = _index_info(repo, symbol)
 
@@ -51,9 +52,11 @@ def get_index_daily(
         return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": [], "source": "none"}
 
     try:
-        raw = kline_sync.sync_daily_batch([symbol], count=days + 150)
+        raw = kline_sync.sync_daily_batch(
+            [symbol], count=days + 150, asset_type="index",
+        )
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"TickFlow fetch failed: {e}") from e
+        raise HTTPException(status_code=502, detail=f"日K数据源拉取失败: {e}") from e
     if raw.is_empty():
         return {"symbol": symbol, "name": info.get("name"), "index_info": info, "rows": [], "source": "none"}
 
@@ -72,7 +75,7 @@ def get_index_minute(
     repo = request.app.state.repo
     capset = request.app.state.capabilities
     info = _index_info(repo, symbol)
-    day = trade_date or date.today()
+    day = trade_date or cn_today()
     df = kline_sync.fetch_minute_single(
         symbol, day, asset_type="index", capset=capset,
     )
@@ -104,8 +107,17 @@ def sync_index_daily(
     capset = request.app.state.capabilities
     if not capset.has(Cap.KLINE_DAILY_BATCH):
         raise HTTPException(status_code=403, detail="需要 Pro+ 权限 (batch K-line)")
-    end = datetime.now()
+    end = cn_now()
     start = end - timedelta(days=days)
     count = index_sync.sync_index_instruments(repo)
-    rows = index_sync.sync_and_persist_index_daily(repo, capset, start_date=start, end_date=end)
+    failed_symbols: list[str] = []
+    rows = index_sync.sync_and_persist_index_daily(
+        repo, capset, start_date=start, end_date=end, failed_out=failed_symbols,
+    )
+    if failed_symbols:
+        sample = ", ".join(dict.fromkeys(failed_symbols[:5]))
+        raise HTTPException(
+            status_code=502,
+            detail=f"指数日K部分拉取失败: {len(set(failed_symbols))} 只标的未更新 (样例: {sample})",
+        )
     return {"status": "ok", "index_count": count, "rows_written": rows}

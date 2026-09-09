@@ -96,3 +96,41 @@ def test_uninstall_plugin_uv_targets_running_interpreter(monkeypatch, tmp_path):
     assert "--python" in uv_cmd
     idx = uv_cmd.index("--python")
     assert uv_cmd[idx + 1] == sys.executable
+
+
+def test_frozen_runtime_never_attempts_python_plugin_dependency_mutation(monkeypatch, tmp_path):
+    """PyInstaller 的 exe 不是可写 Python 环境, 安装/卸载必须在 subprocess 前拒绝。"""
+    _fake_python_plugin(monkeypatch, tmp_path)
+    monkeypatch.setattr(loader, "_is_frozen_runtime", lambda: True)
+    monkeypatch.setattr(
+        loader.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("frozen 环境不得启动 pip/uv")),
+    )
+
+    install_ok, install_message = loader.install_plugin("baostock")
+    uninstall_ok, uninstall_message = loader.uninstall_plugin("baostock")
+
+    assert install_ok is False
+    assert "桌面版" in install_message
+    assert uninstall_ok is False
+    assert "桌面版" in uninstall_message
+
+
+def test_frozen_plugin_status_marks_dependencies_as_package_managed(monkeypatch, tmp_path):
+    """设置页据此隐藏无效的安装/卸载操作, 而非只在后端报错。"""
+    _fake_python_plugin(monkeypatch, tmp_path)
+    monkeypatch.setattr(loader, "_is_frozen_runtime", lambda: True)
+    monkeypatch.setattr(loader, "_PLUGIN_STATUS", {})
+    monkeypatch.setattr(loader, "_PROVIDERS", {})
+
+    class Provider:
+        pass
+
+    monkeypatch.setattr(loader, "_load_entry", lambda _entry: Provider)
+    manifest = loader.plugin_manifest("baostock")
+    assert manifest is not None
+
+    loader._register_one_plugin(manifest)
+
+    assert loader._PLUGIN_STATUS["baostock"]["dependency_managed"] is True

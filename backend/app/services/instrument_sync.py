@@ -43,32 +43,60 @@ def _flatten_instruments(items: list[dict]) -> list[dict]:
     return rows
 
 
-def _fetch_instruments_via_provider() -> list[dict] | None:
-    """若当前日K数据源不是 tickflow 且该 provider 提供 get_instruments, 用它拉标的维表。
+def _provider_supports_instrument_asset(provider, asset_type: str) -> bool:
+    """兼容旧 Provider: 未声明时仅支持股票维表。"""
+    declared = getattr(provider, "instrument_asset_types", {"stock"})
+    try:
+        return asset_type in {str(value).lower() for value in declared}
+    except TypeError:
+        return asset_type == "stock"
 
-    返回 flatten 行列表; 未命中(仍应走 tickflow)时返回 None。
-    标的维表跟随日K数据源(二者天然耦合, 无独立偏好项)。
+
+def fetch_instruments_via_provider(asset_type: str = "stock") -> tuple[bool, list[dict]]:
+    """从当前日K Provider 拉基础维表。
+
+    返回 ``(handled, rows)``: ``handled=False`` 才允许调用方使用 TickFlow。普通历史
+    Provider 维持 ``handled=True, rows=[]`` 的兼容语义; 声明来源隔离的 Provider 在
+    不可用、失败或返回空维表时直接报错, 禁止把“全量同步”静默降级成旧标的池或 DEMO。
     """
     from app.services import preferences
 
     provider_name = preferences.get_daily_data_provider()
     if provider_name == "tickflow":
-        return None
+        return False, []
     from app.data_providers import custom as custom_sources
 
+    source_isolated = custom_sources.plugin_requires_source_isolation(provider_name)
     if not custom_sources.is_custom_provider(provider_name):
-        return None
-    provider = custom_sources.get_provider(provider_name)
-    if not hasattr(provider, "get_instruments"):
-        return None
+        if source_isolated:
+            raise RuntimeError(f"日K Provider {provider_name} 当前不可用, 无法同步标的维表")
+        return False, []
     try:
-        items = provider.get_instruments("stock") or []
-    except Exception as e:  # noqa: BLE001
-        logger.warning("provider %s get_instruments 失败: %s", provider_name, e)
-        return None
-    rows = _flatten_instruments(items)
-    logger.info("instruments via %s: %d stocks", provider_name, len(rows))
-    return rows
+        provider = custom_sources.get_provider(provider_name)
+    except Exception as e:
+        logger.warning("provider %s 解析失败: %s", provider_name, e)
+        if source_isolated:
+            raise RuntimeError(f"日K Provider {provider_name} 解析失败, 无法同步标的维表: {e}") from e
+        return True, []
+    get_instruments = getattr(provider, "get_instruments", None)
+    if not callable(get_instruments) or not _provider_supports_instrument_asset(provider, asset_type):
+        if source_isolated:
+            raise RuntimeError(f"日K Provider {provider_name} 不支持 {asset_type} 标的维表")
+        return False, []
+    try:
+        items = get_instruments(asset_type) or []
+        rows = _flatten_instruments(items)
+    except Exception as e:
+        logger.warning("provider %s get_instruments(%s) 失败: %s", provider_name, asset_type, e)
+        if source_isolated:
+            raise RuntimeError(
+                f"日K Provider {provider_name} 获取 {asset_type} 标的维表失败: {e}",
+            ) from e
+        return True, []
+    if source_isolated and not rows:
+        raise RuntimeError(f"日K Provider {provider_name} 未返回可用 {asset_type} 标的维表")
+    logger.info("instruments via %s: %d %s", provider_name, len(rows), asset_type)
+    return True, rows
 
 
 def sync_instruments(data_dir: Path) -> int:
@@ -76,8 +104,8 @@ def sync_instruments(data_dir: Path) -> int:
 
     返回写入的行数。
     """
-    all_rows = _fetch_instruments_via_provider()
-    if all_rows is None:
+    handled, all_rows = fetch_instruments_via_provider("stock")
+    if not handled:
         # 未命中非 tickflow provider → 走 tickflow 直连
         tf = get_client()
         all_rows = []

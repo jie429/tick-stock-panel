@@ -401,6 +401,13 @@ def _minute_history_days() -> int | None:
     return getattr(provider, "minute_history_days", None)
 
 
+def _minute_universe_sync_supported() -> bool:
+    """当前分钟源是否支持全市场分钟落盘。"""
+    from app.services import kline_sync
+
+    return kline_sync.minute_universe_sync_supported()
+
+
 class MinuteSyncPrefs(BaseModel):
     minute_sync_enabled: bool
     minute_sync_days: int = 5
@@ -509,6 +516,7 @@ def get_preferences() -> dict:
         "minute_data_provider": preferences.get_minute_data_provider(),
         "full_minute_data_provider": preferences.get_full_minute_data_provider(),
         "minute_history_days": _minute_history_days(),
+        "minute_universe_sync_supported": _minute_universe_sync_supported(),
         "depth5_data_provider": preferences.get_depth5_data_provider(),
         "realtime_data_provider": preferences.get_realtime_data_provider(),
         "financial_data_provider": preferences.get_financial_provider(),
@@ -648,26 +656,56 @@ def clear_plugin_key(name: str) -> dict:
 
 
 @router.post("/data-sources/reload")
-def reload_data_sources() -> dict:
+def reload_data_sources(request: Request) -> dict:
     """重新加载 data_sources/*.yaml。"""
     from app.data_providers import custom as custom_sources
-    custom_sources.load_all()
+    depth_svc = getattr(request.app.state, "depth_service", None)
+    transition_started = False
+    if depth_svc:
+        depth_svc.begin_provider_change()
+        transition_started = True
+    try:
+        custom_sources.load_all()
+        # 重载可能改变当前 depth5 插件的可用性。先刷新能力快照, 再让服务清理
+        # 旧缓存并按最新能力启停轮询, 避免插件注册表的瞬时空窗永久停掉轮询。
+        request.app.state.capabilities = detect_capabilities()
+    except Exception:
+        if transition_started:
+            depth_svc.abort_provider_change()
+        raise
+    if transition_started:
+        depth_svc.sync_provider_change()
     return list_data_sources()
 
 
 @router.post("/plugins/{name}/install")
-def install_plugin(name: str) -> dict:
+def install_plugin(name: str, request: Request) -> dict:
     """安装指定插件的依赖 (npm install / pip install), 完成后重新扫描。
 
     根据 plugin.yaml 的 runtime 字段决定安装方式。安装可能耗时较长 (网络下载),
     客户端需设较长超时。
     """
     from app.data_providers import custom as custom_sources
+    from app.services import preferences
     if not custom_sources.is_builtin(name):
         raise HTTPException(status_code=404, detail=f"插件 '{name}' 不存在")
-    ok, message = custom_sources.install_plugin(name)
-    # 无论成功失败都重新扫描, 刷新插件状态 (安装可能部分成功)
-    custom_sources.load_all()
+    depth_svc = getattr(request.app.state, "depth_service", None)
+    depth_provider_affected = preferences.get_depth5_data_provider() == name
+    transition_started = False
+    if depth_provider_affected and depth_svc:
+        depth_svc.begin_provider_change()
+        transition_started = True
+    try:
+        ok, message = custom_sources.install_plugin(name)
+        # 无论安装命令是否成功都重新扫描: 失败也可能是依赖已经部分落地, 状态必须刷新。
+        custom_sources.load_all()
+        request.app.state.capabilities = detect_capabilities()
+    except Exception:
+        if transition_started:
+            depth_svc.abort_provider_change()
+        raise
+    if transition_started:
+        depth_svc.sync_provider_change()
     result = list_data_sources()
     result["install_ok"] = ok
     result["install_message"] = message
@@ -675,7 +713,7 @@ def install_plugin(name: str) -> dict:
 
 
 @router.delete("/plugins/{name}/install")
-def uninstall_plugin(name: str) -> dict:
+def uninstall_plugin(name: str, request: Request) -> dict:
     """卸载指定插件的依赖 (删除 node_modules / pip uninstall), 完成后重新扫描。
 
     如果该插件当前正被使用, 自动回退到 tickflow。
@@ -684,17 +722,40 @@ def uninstall_plugin(name: str) -> dict:
     from app.services import preferences
     if not custom_sources.is_builtin(name):
         raise HTTPException(status_code=404, detail=f"插件 '{name}' 不存在")
-    ok, message = custom_sources.uninstall_plugin(name)
-    # 卸载后若该插件正被使用, 回退 tickflow
-    for getter, key, default in [
-        (preferences.get_daily_data_provider, "daily_data_provider", "tickflow"),
-        (preferences.get_minute_data_provider, "minute_data_provider", "tickflow"),
-        (preferences.get_realtime_data_provider, "realtime_data_provider", "tickflow"),
-        (preferences.get_financial_provider, "financial_data_provider", "tickflow"),
-    ]:
-        if getter() == name:
-            preferences.save({key: default})
-    custom_sources.load_all()
+    depth_svc = getattr(request.app.state, "depth_service", None)
+    depth_provider_changed = preferences.get_depth5_data_provider() == name
+    transition_started = False
+    if depth_provider_changed and depth_svc:
+        depth_svc.begin_provider_change()
+        transition_started = True
+    try:
+        ok, message = custom_sources.uninstall_plugin(name)
+        if not ok:
+            if transition_started:
+                depth_svc.abort_provider_change()
+            result = list_data_sources()
+            result["uninstall_ok"] = ok
+            result["uninstall_message"] = message
+            return result
+
+        # 卸载成功后若该插件正被使用, 显式切回 TickFlow。
+        for getter, key, default in [
+            (preferences.get_daily_data_provider, "daily_data_provider", "tickflow"),
+            (preferences.get_minute_data_provider, "minute_data_provider", "tickflow"),
+            (preferences.get_depth5_data_provider, "depth5_data_provider", "tickflow"),
+            (preferences.get_realtime_data_provider, "realtime_data_provider", "tickflow"),
+            (preferences.get_financial_provider, "financial_data_provider", "tickflow"),
+        ]:
+            if getter() == name:
+                preferences.save({key: default})
+        custom_sources.load_all()
+        request.app.state.capabilities = detect_capabilities()
+    except Exception:
+        if transition_started:
+            depth_svc.abort_provider_change()
+        raise
+    if transition_started:
+        depth_svc.sync_provider_change()
     result = list_data_sources()
     result["uninstall_ok"] = ok
     result["uninstall_message"] = message
@@ -783,12 +844,59 @@ def test_data_source(req: CustomSourceTestIn) -> dict:
 @router.put("/preferences/data-providers")
 def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
     """保存数据源选择。"""
+    from app.data_providers import custom as custom_sources
+    from app.data_providers.capabilities import dataset_for_provider_preference
     from app.services import preferences
     updates = req.model_dump(exclude_none=True)
-    if updates:
-        preferences.save(updates)
-    # 刷新能力快照: 当前 provider 变化会改变自定义源能力增广结果 (读缓存, 无网络请求)
-    request.app.state.capabilities = detect_capabilities()
+
+    # Only allow a provider for a dataset it currently declares and loads. This
+    # prevents tdx_mcp from being selected for realtime/financial and reaching
+    # a legacy TickFlow fallback. Existing isolated preferences still stay
+    # fail-closed during a dependency failure; this only rejects new invalid writes.
+    normalized_updates: dict[str, str] = {}
+    for field, raw_provider in updates.items():
+        dataset = dataset_for_provider_preference(field)
+        provider = str(raw_provider or "").strip().lower()
+        if not provider or dataset is None:
+            raise HTTPException(status_code=422, detail=f"无效的数据源设置字段: {field}")
+        if provider != "tickflow":
+            try:
+                available = custom_sources.provider_has_dataset(provider, dataset)
+            except Exception as exc:
+                logger.warning(
+                    "validate data provider %s for %s failed: %s",
+                    provider,
+                    dataset,
+                    exc,
+                )
+                available = False
+            if not available:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        f"数据源 '{provider}' 当前不可用, 或未声明 {dataset} 数据集"
+                    ),
+                )
+        normalized_updates[field] = provider
+    updates = normalized_updates
+
+    depth_svc = getattr(request.app.state, "depth_service", None)
+    depth_provider_changed = "depth5_data_provider" in updates
+    transition_started = False
+    if depth_provider_changed and depth_svc:
+        depth_svc.begin_provider_change()
+        transition_started = True
+    try:
+        if updates:
+            preferences.save(updates)
+        # 刷新能力快照: 当前 provider 变化会改变自定义源能力增广结果 (读缓存, 无网络请求)
+        request.app.state.capabilities = detect_capabilities()
+    except Exception:
+        if transition_started:
+            depth_svc.abort_provider_change()
+        raise
+    if transition_started:
+        depth_svc.sync_provider_change()
     return {
         "daily_data_provider": preferences.get_daily_data_provider(),
         "adj_factor_provider": preferences.get_adj_factor_provider(),
@@ -1824,7 +1932,7 @@ class DepthPollingIntervalIn(BaseModel):
 
 @router.put("/preferences/depth-polling-interval")
 def update_depth_polling_interval(req: DepthPollingIntervalIn, request: Request) -> dict:
-    """保存五档盘口盘中轮询间隔(秒)。需 Pro+。"""
+    """保存五档盘口盘中轮询间隔(秒)。需当前路由具备五档能力。"""
     from app.tickflow.capabilities import Cap
     request.app.state.capabilities.require(Cap.DEPTH5_BATCH)
 
@@ -1840,7 +1948,7 @@ class DepthFinalizeTimeIn(BaseModel):
 
 @router.put("/preferences/depth-finalize-time")
 def update_depth_finalize_time(req: DepthFinalizeTimeIn, request: Request) -> dict:
-    """保存盘后 sealed 定版时间(范围15:01~18:00)并立即 reschedule。需 Pro+。"""
+    """保存盘后 sealed 定版时间(范围15:01~18:00)并立即 reschedule。需五档能力。"""
     from app.tickflow.capabilities import Cap
     request.app.state.capabilities.require(Cap.DEPTH5_BATCH)
 
