@@ -1879,9 +1879,190 @@ export interface StrategyAlertEvent {
   [key: string]: unknown
 }
 
+// ===== 二开: dragon-quant 龙头策略 =====
+export interface DragonQuantStatus {
+  status: 'ready' | 'needs_industry_data'
+  source: { project: string; version: string; license: string }
+  data_source: 'tick-stock-panel'
+  industry_source: string | null
+  industry_symbols: number
+  latest_enriched_date: string | null
+  depth_service_available: boolean
+  scan_count: number
+  backtest_count: number
+  adaptations: string[]
+}
+
+export interface DragonDimension {
+  score: number
+  weight: number
+  details: Record<string, unknown>
+}
+
+export interface DragonScanRow {
+  symbol: string
+  name: string
+  industry: string
+  industries: string[]
+  board_count: number
+  five_day_return_pct: number
+  turnover_rate_pct: number
+  amount_yuan: number
+  composite_score: number
+  score_passed: boolean
+  is_true_dragon: boolean
+  reject_reason: string | null
+  rank: number | null
+  dimensions: Record<'drive' | 'leadership' | 'anti_drop' | 'liquidity' | 'absorption', DragonDimension>
+}
+
+export interface DragonScanSummary {
+  id: string
+  as_of: string
+  created_at: string
+  options: Record<string, number | boolean>
+  data_quality: {
+    complete: boolean
+    missing: string[]
+    critical_missing?: string[]
+    optional_missing?: string[]
+    adaptations: string[]
+    industry_source?: string | null
+    leading_industries?: Array<{ name: string; change_pct: number }>
+    lagging_industries?: Array<{ name: string; change_pct: number }>
+    minute_rows?: number
+    minute_symbols_requested?: number
+    minute_symbols_fetched?: number
+    industry_minute_coverage?: Record<string, number>
+    market_source?: string
+    market_minute_rows?: number
+    market_minute_fetched?: boolean
+    depth_ready?: boolean
+    depth_fetch_attempted?: boolean
+    depth_fetch_result?: { ok?: boolean; count?: number; msg?: string } | null
+    fetch_errors?: string[]
+  }
+  summary: {
+    candidate_count: number
+    returned_count: number
+    score_passed_count: number
+    true_dragon_count: number
+  }
+}
+
+export interface DragonScanDetail extends DragonScanSummary {
+  rows: DragonScanRow[]
+}
+
+export interface DragonScanRequest {
+  as_of: string
+  top_industries: number
+  lagging_industries: number
+  industry_level: number
+  result_limit: number
+  absorption_days: number
+}
+
+export interface DragonTrade {
+  trade_date: string
+  symbol: string
+  name: string
+  side: 'buy' | 'sell'
+  price: number
+  quantity: number
+  amount: number
+  fee: number
+  reason_code: string
+  reason_text: string
+  candidate_date?: string
+  composite_score?: number
+}
+
+export interface DragonEquityPoint {
+  date: string
+  cash: number
+  market_value: number
+  equity: number
+  return_pct: number
+  drawdown_pct: number
+  positions: number
+}
+
+export interface DragonBacktestSummary {
+  id: string
+  start: string
+  end: string
+  created_at: string
+  warnings: string[]
+  config: Record<string, number | boolean>
+  stats: {
+    initial_cash: number
+    final_equity: number
+    total_return_pct: number
+    max_drawdown_pct: number
+    trade_count: number
+  }
+}
+
+export interface DragonBacktestDetail extends DragonBacktestSummary {
+  trades: DragonTrade[]
+  equity_curve: DragonEquityPoint[]
+  open_positions: Array<Record<string, string | number>>
+  used_scan_ids: string[]
+}
+
+export interface DragonBacktestRequest {
+  start: string
+  end: string
+  initial_cash: number
+  candidate_top_n: number
+  candidate_lookback_days: number
+  max_positions: number
+  min_score: number
+  min_amount: number
+  min_turnover: number
+  first_day_stop_loss_pct: number
+  stop_loss_pct: number
+  breakeven_activate_pct: number
+  trailing_activate_pct: number
+  trailing_drawdown_pct: number
+  auto_scan_missing: boolean
+}
+
 // ===== API surface =====
 export const api = {
   health: () => request<{ status: string; version: string; mode: string }>('/health'),
+
+  dragonQuantStatus: () =>
+    request<DragonQuantStatus>('/api/custom/dragon-quant/status'),
+  dragonQuantScans: () =>
+    request<DragonScanSummary[]>('/api/custom/dragon-quant/scans'),
+  dragonQuantScan: (id: string) =>
+    request<DragonScanDetail>(`/api/custom/dragon-quant/scans/${encodeURIComponent(id)}`),
+  dragonQuantRunScan: (payload: DragonScanRequest) =>
+    request<DragonScanDetail>('/api/custom/dragon-quant/scans', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS,
+    }),
+  dragonQuantDeleteScan: (id: string) =>
+    request<{ ok: boolean }>(`/api/custom/dragon-quant/scans/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
+  dragonQuantBacktests: () =>
+    request<DragonBacktestSummary[]>('/api/custom/dragon-quant/backtests'),
+  dragonQuantBacktest: (id: string) =>
+    request<DragonBacktestDetail>(`/api/custom/dragon-quant/backtests/${encodeURIComponent(id)}`),
+  dragonQuantRunBacktest: (payload: DragonBacktestRequest) =>
+    request<DragonBacktestDetail>('/api/custom/dragon-quant/backtests', {
+      method: 'POST',
+      body: JSON.stringify(payload),
+      timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS,
+    }),
+  dragonQuantDeleteBacktest: (id: string) =>
+    request<{ ok: boolean }>(`/api/custom/dragon-quant/backtests/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+    }),
 
   // ===== Auth (访问认证) =====
   authStatus: () =>
