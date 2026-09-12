@@ -1,6 +1,6 @@
 # 数据源插件开发指南
 
-数据源插件是可选的行情数据来源(fuyao、stock-sdk、akshare 等),作为独立模块放在
+数据源插件是可选的行情数据来源(fuyao、麦蕊智数、stock-sdk、akshare 等),作为独立模块放在
 `backend/app/plugins/` 下。services 层(kline_sync / quote_service / financial_sync)
 全部通过统一路由点分流:插件声明了某数据集就走插件,未声明自动回退 TickFlow。
 因此**日K、分钟K、实时、除权和财务等已接通的数据集**只需正确实现契约，无需改动
@@ -335,6 +335,12 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - `client.py` — httpx 客户端(X-api-key 认证 + 统一信封解包 + 分页 + 页间隔限频 + 单标的日K + dump 预签名下载, S3 下载不带 Key 头)
   - `provider.py` — Provider 实现(实测/文档双字段名映射、百分数→小数制、volume 股→手、上海零点戳 +8h 时区、dump 按 release 版本缓存、软失败、Key 探测)
   - `tests/test_fuyao_provider.py` — 73 个契约测试, 是新插件的测试范本
+- **`backend/app/plugins/mairui/`** — 麦蕊智数沪深 A 股 REST 数据源(runtime: none, 纯 HTTP 零依赖)
+  - 提供 `daily`、`realtime`、`depth5`、`financial`,其中实时行情按官方每批 20 只与基础限频分批拉取,Provider 将轮询下限抬至 60 秒
+  - 日K与实时 `volume` 上游原生为手,不重复换算;`change_pct`、`amplitude`、`turnover_rate` 从百分数显式 `/100`;五档缺档保留 `None`
+  - 财务三表、主要指标与公司股本统一映射到 `period_end` / `announce_date` 和项目 canonical 字段,供应商独有数值列同时透传
+  - 普通 licence 无 1 分钟能力,不声明 `minute/full_minute`;近年分红接口不覆盖完整配股事件,不声明 `adj_factor`
+  - licence 在设置页先探后存,或通过 `MAIRUI_LICENSE` 配置;真实 licence 永不写入代码、清单或测试
 - **`backend/app/plugins/stocksdk/`** — Node 型插件, 通过 subprocess 桥接调用 stock-sdk
   - `bridge.py` — Python↔Node 桥接 + availability 检测
   - `bridge.mjs` — Node 端(并发池、重试、SDK 解析)

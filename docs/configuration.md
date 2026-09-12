@@ -31,6 +31,17 @@ TickFlow 是内置默认数据源;同时支持插件化接入第三方数据源(
 >
 > **档位仅适用于 TickFlow 数据源**。功能门槛的统一标准是"能力"(`kline.minute.batch`、`depth5.batch`、`financial` 等能力键):其他第三方/自定义数据源以声明的数据集能力为准,系统会按当前数据源配置自动合并判定,UI 提示一律以能力名表达,不再依赖 TickFlow 档位名。
 
+### 内置插件凭据
+
+`fuyao` 与“麦蕊智数”等内置 HTTP 插件可直接在 **设置 → 数据源** 的插件卡片中填写凭据。后端会先发起只读探测,验证通过后才写入本机 `data/user_data/secrets.json`;凭据不会进入 Git。也可通过环境变量配置:
+
+```ini
+FUYAO_API_KEY=
+MAIRUI_LICENSE=
+```
+
+麦蕊智数当前接入沪深 A 股维表、原始日K、全市场分批实时行情、五档盘口、财务三表/主要指标/历史股本。普通 licence 的分钟接口最细为 5 分钟,不满足本项目 `minute/full_minute` 的 1 分钟契约;只有开通 Quant Pro 且 1 分钟接口探测成功后才可扩展该能力。麦蕊没有可证明完整的独立除权事件接口,因此本插件不声明 `adj_factor`,避免生成不完整复权链。
+
 ### 全量分钟 (full_minute)
 
 「全量分钟」是一项**独立能力**(能力键 `full_minute`,探测名 `intraday.universe`),与其他能力同样**可路由**:盘中把全市场当日 1 分钟 K 持续增量落盘到本地 `data/kline_minute/` 当日分区,分钟策略(`minute_filter`)与分时视图即可读到新鲜数据。接入方式二选一:

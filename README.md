@@ -106,7 +106,7 @@
     </tr>
     <tr>
       <td nowrap>🧰 <b>数据扩展</b></td>
-      <td>数据源插件化(TickFlow/fuyao/stock-sdk + YAML 自定义源),扩展字段配成一级页面同台分析;时序表(如人气排行)支持按日历史回补,接口配日期参数即可逐日补齐</td>
+      <td>数据源插件化(TickFlow/fuyao/麦蕊智数/stock-sdk + YAML 自定义源),扩展字段配成一级页面同台分析;时序表(如人气排行)支持按日历史回补,接口配日期参数即可逐日补齐</td>
       <td nowrap><a href="./docs/custom-data-source.md">custom-data-source.md</a></td>
     </tr>
   </tbody>
@@ -210,7 +210,7 @@
 flowchart TB
     subgraph DATA["数据源层 · 插件化"]
         direction LR
-        D1["TickFlow SDK"] ~~~ D2["fuyao<br/>同花顺 REST"] ~~~ D3["stock-sdk"] ~~~ D4["YAML 自定义源"] ~~~ D5["+ 更多插件…"]
+        D1["TickFlow SDK"] ~~~ D2["fuyao<br/>同花顺 REST"] ~~~ D3["麦蕊智数<br/>沪深 REST"] ~~~ D4["stock-sdk"] ~~~ D5["YAML 自定义源"]
     end
 
     subgraph ROUTE["能力路由层"]
@@ -304,7 +304,7 @@ flowchart TB
 | **后端**     | FastAPI · Pydantic v2 · APScheduler · sse-starlette                                               |
 | **数据**     | Polars(计算)· DuckDB(查询)· Parquet(存储)                                                         |
 | **回测**     | 自研仓位模拟引擎(T+1/费用/滑点/分钟回放)· vectorbt(部分路径)                                       |
-| **数据源**   | [TickFlow](https://tickflow.org/auth/register?ref=V3KDKGXPEA) 官方 SDK · fuyao(同花顺 REST) · 插件化扩展(stock-sdk 示例插件 · YAML 自定义源) |
+| **数据源**   | [TickFlow](https://tickflow.org/auth/register?ref=V3KDKGXPEA) 官方 SDK · fuyao(同花顺 REST) · 麦蕊智数(沪深 REST) · 插件化扩展(stock-sdk 示例插件 · YAML 自定义源) |
 | **AI**(可选) | OpenAI 兼容接口(DeepSeek / 通义 / Ollama 等)                                                      |
 | **前端**     | React 18 · Vite · TypeScript · Tailwind · Tanstack Query · [Lightweight Charts](https://www.tradingview.com/lightweight-charts/)(TradingView 开源) · ECharts · dnd-kit |
 | **部署**     | Docker 两阶段构建,前端 dist 拷进后端镜像,**单容器**                                               |
@@ -478,6 +478,8 @@ fork同时请点个star哦,欢迎 Issue 和 PR。
 本项目依赖 [TickFlow](https://tickflow.org/auth/register?ref=V3KDKGXPEA) 提供数据服务,使用前请遵守其服务条款
 
 内置数据源插件 [fuyao](https://fuyao.aicubes.cn/docs/api-reference/) 提供同花顺 REST 数据接口(行情 / 财务 / 龙虎榜 / 盘前风向标 / 交易日历等),需自备 API Key,使用前请遵守其服务条款
+
+内置数据源插件 [麦蕊智数](https://www.mairuiapi.com/hsdata) 提供沪深 A 股 REST 数据接口(日K / 实时行情 / 五档盘口 / 财务报表与股本),需自备 licence,使用前请遵守其服务条款与配额限制。1 分钟 K 线需另行开通 Quant Pro。
 
 数据源插件 [stock-sdk](https://stock-sdk.linkdiary.cn) 遵循其各自的 ISC 协议。
 

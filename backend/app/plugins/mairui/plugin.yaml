@@ -1,0 +1,11 @@
+name: mairui
+display_name: "麦蕊智数"
+runtime: none
+entry: app.plugins.mairui.provider:MairuiProvider
+check: app.plugins.mairui.provider:availability
+datasets: [daily, realtime, depth5, financial]
+api_key_env: MAIRUI_LICENSE
+fallback_to_tickflow_on_error: false
+description: "麦蕊智数沪深 A 股 REST 数据源。接入股票维表、原始日K、全市场分批实时行情、五档盘口、财务三表/指标/历史股本。当前普通 licence 最细为5分钟，而项目分钟契约要求1分钟，因此不声明 minute/full_minute；官方无完整独立除权事件接口，不声明 adj_factor。"
+install_hint: "在卡片中填写 licence，或通过环境变量 MAIRUI_LICENSE 配置。1分钟K需另行开通 Quant Pro。"
+homepage: "https://www.mairuiapi.com/hsdata"
