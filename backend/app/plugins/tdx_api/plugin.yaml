@@ -1,0 +1,13 @@
+# tdx-api — 通达信 HTTP 数据服务(外部项目 tdx-api-main)的项目内 Provider。
+# 纯 HTTP REST 源, 无额外依赖(runtime: none)。服务地址默认 http://127.0.0.1:8080,
+# 非默认时用 TDX_API_BASE_URL(.env / 环境变量)覆盖。
+
+name: tdx_api
+display_name: "tdx-api (通达信 HTTP)"
+runtime: none
+entry: app.plugins.tdx_api.provider:TdxApiProvider
+check: app.plugins.tdx_api.provider:availability
+datasets: [daily, minute, realtime, depth5]
+fallback_to_tickflow_on_error: false
+description: "外部 tdx-api 服务(通达信协议转 HTTP)。原始日K(股票/ETF/指数, 按窗口回补)、1分钟K(股票/ETF, 上游仅保留最近约 90 个交易日)、全市场分批实时快照(股票+ETF 合计约 7700 只, 单批 50 只)、五档盘口(缺档保留空值)、指数实时补拉(指数不在 A 股快照里, 用带前缀指数码单独拉取)。上游无除权事件接口, 不声明 adj_factor; 无财务报表接口, 不声明 financial; 指数分钟上游仅 100 条且口径不一致, 不声明。"
+install_hint: "先启动 tdx-api 服务(默认 http://127.0.0.1:8080); 非默认地址请在 .env 配置 TDX_API_BASE_URL。"
