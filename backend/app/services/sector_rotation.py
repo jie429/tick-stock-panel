@@ -33,6 +33,7 @@ from typing import Any
 
 import polars as pl
 
+from app.market_time import trading_minutes_elapsed_from_dt
 from app.services.ext_data import ExtConfigStore
 from app.services.rps_rotation import _load_concept_map_df
 
@@ -120,6 +121,9 @@ def _prev_daily_close(data_dir: Path, target_date: str) -> pl.DataFrame | None:
     return (
         df.with_columns(_bare().alias("_bare"))
         .select([pl.col("_bare"), pl.col("close").cast(pl.Float64).alias("prev_close")])
+        # 前收 <= 0 / 非有限视为缺失 (否则 close/ref 为 inf, 整个响应 JSON 渲染 500),
+        # 缺失时由调用方退化为当日首根有效分钟 close
+        .filter(pl.col("prev_close").is_finite() & (pl.col("prev_close") > 0))
         .unique(subset=["_bare"], keep="last")
     )
 
@@ -140,7 +144,10 @@ def _minute_pcts(minute_dir: Path, target: str) -> tuple[pl.DataFrame | None, st
         except Exception as exc:
             logger.warning("sector_rotation read minute partition failed: %s", exc)
             return None, "minute_schema", False
-    bars = bars.drop_nulls(subset=["datetime", "close"])
+    # close <= 0 / 非有限的分钟行无效: 作基准时 pct 为 inf, 作分子时是 -100% 假跌幅
+    bars = bars.drop_nulls(subset=["datetime", "close"]).filter(
+        pl.col("close").cast(pl.Float64).is_finite() & (pl.col("close") > 0)
+    )
     if bars.is_empty():
         return None, "minute_empty", has_amount
     bars = bars.with_columns(_bare().alias("_bare"))
@@ -217,7 +224,9 @@ def _load_sector_flow(data_dir: Path, flow_field: str) -> pl.DataFrame | None:
         ])
         .drop_nulls(subset=["_flow", "_bare"])
         .filter(pl.col("_flow").is_finite() & (pl.col("_flow") != 0.0))
-        .unique(subset=["_bare"], keep="first")
+        # 与 screener._load_ext_value_maps / ext_factors 同口径取每标的最后一行:
+        # 日内序列表 (time_field) 分区按时间列升序落盘, 最后一行 = 最新一盘
+        .unique(subset=["_bare"], keep="last")
     )
     return out if not out.is_empty() else None
 
@@ -466,11 +475,12 @@ def _compute(repo, data_dir: Path, kind: str, flow_field: str | None, top: int, 
     per_bucket.sort(key=lambda item: item["bucket"])
     market_map = {row["_bucket"]: row["_mpct"] for row in market.iter_rows(named=True)}
 
-    # 对照窗口: 距当前桶约 _RANK_WINDOW_MIN 分钟的最近历史桶
+    # 对照窗口: 距当前桶约 _RANK_WINDOW_MIN 个交易分钟的最近历史桶 (午休不计,
+    # 与活跃度窗口按桶数回看同口径; 按墙钟算时 13:00~13:59 会拿 11:30 桶作「1 小时前」)
     def _reference_index(index: int) -> int | None:
-        current = per_bucket[index]["bucket"]
+        current = trading_minutes_elapsed_from_dt(per_bucket[index]["bucket"])
         for back in range(index - 1, -1, -1):
-            delta_min = (current - per_bucket[back]["bucket"]).total_seconds() / 60.0
+            delta_min = current - trading_minutes_elapsed_from_dt(per_bucket[back]["bucket"])
             if delta_min >= _RANK_WINDOW_MIN:
                 return back
         return 0 if index > 0 else None  # 不足一小时: 与最早桶比; 首桶无对照

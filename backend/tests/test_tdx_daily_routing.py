@@ -507,7 +507,8 @@ def test_index_read_apis_default_to_beijing_date(monkeypatch):
     repo = MagicMock()
     repo.get_index_instruments.return_value = pl.DataFrame()
     repo.get_index_daily.side_effect = (
-        lambda _symbol, start, end: daily_window.update(start=start, end=end) or pl.DataFrame()
+        lambda _symbol, start, end, columns=None:
+        daily_window.update(start=start, end=end) or pl.DataFrame()
     )
     request = SimpleNamespace(
         app=SimpleNamespace(
@@ -518,6 +519,8 @@ def test_index_read_apis_default_to_beijing_date(monkeypatch):
         ),
     )
     monkeypatch.setattr(indices, "cn_today", lambda: today)
+    # 上游新增休市回退: 本用例只验证默认日期口径, 固定交易日判定避免按真实时钟走分支
+    monkeypatch.setattr(indices.trading_day, "is_trading_day", lambda: True)
     monkeypatch.setattr(
         indices.kline_sync,
         "fetch_minute_single",

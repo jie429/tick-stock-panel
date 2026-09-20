@@ -20,7 +20,7 @@ import polars as pl
 from app.data_providers.base import AssetType
 from app.indicators.pipeline import filter_halt_days
 from app.market_time import CN_TZ, cn_now, cn_today
-from app.services import preferences
+from app.services import minute_adjust, preferences
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.client import get_client
 from app.tickflow.rate_limits import chunked, resolve_limit, sleep_between_batches
@@ -128,6 +128,73 @@ def _resolve_daily_provider(asset_type: AssetType | str) -> object | None:
     return provider
 
 
+def _instruments_symbol_index(data_dir) -> dict[str, list[str]] | None:
+    """裸代码 → instruments 维表完整符号列表; 维表缺失/不可读返回 None。"""
+    path = data_dir / "instruments" / "instruments.parquet"
+    if not path.exists():
+        return None
+    try:
+        symbols = pl.read_parquet(path, columns=["symbol"])["symbol"].drop_nulls().to_list()
+    except Exception as e:
+        logger.warning("instruments 维表读取失败, 裸符号无法补全后缀: %s", e)
+        return None
+    index: dict[str, list[str]] = {}
+    for s in symbols:
+        code, _, _suffix = str(s).partition(".")
+        if code:
+            index.setdefault(code, []).append(str(s))
+    return index
+
+
+def _normalize_bare_symbols(
+    symbols: list[str], data_dir,
+) -> tuple[list[str], dict[str, str], list[str]]:
+    """裸符号(无交易所后缀, 如 600000)按 instruments 维表补全为 600000.SH (#302)。
+
+    返回 (规范化后的去重请求列表, {裸符号: 补全后符号}, 被跳过的裸符号)。
+    上游对裸符号返回 200 空 payload, 本地静默写 0 行 — 补全失败时显式跳过并告警,
+    不再带着已知无效的符号发请求。全部带后缀时不读维表, 行为与开销同旧版;
+    带后缀符号原样透传, 由上游照常处理。
+    """
+    bare = [s for s in symbols if "." not in s]
+    if not bare:
+        return symbols, {}, []
+
+    index = _instruments_symbol_index(data_dir)
+    resolved: dict[str, str] = {}
+    skipped: list[str] = []
+    for s in bare:
+        matches = (index or {}).get(s, [])
+        if len(matches) == 1:
+            resolved[s] = matches[0]
+        else:
+            skipped.append(s)
+
+    if index is None:
+        logger.warning(
+            "日K同步: instruments 维表不可用, %d 个裸符号(无交易所后缀)将被跳过 — "
+            "请先同步标的维表, 或改用带后缀符号 (如 600000.SH)", len(skipped))
+    elif skipped:
+        logger.warning(
+            "日K同步: %d 个裸符号在维表中无唯一匹配(不支持或非股票), 已跳过: %s",
+            len(skipped), skipped[:20])
+    if resolved:
+        logger.info("日K同步: 已按维表补全 %d 个裸符号后缀 (样例: %s)",
+                    len(resolved), list(resolved.items())[:5])
+
+    out: list[str] = []
+    seen: set[str] = set()
+    skipped_set = set(skipped)
+    for s in symbols:
+        if s in skipped_set:
+            continue  # 无法补全的裸符号不发请求 (上游必然 200 空 payload)
+        full = resolved.get(s, s)
+        if full not in seen:
+            seen.add(full)
+            out.append(full)
+    return out, resolved, skipped
+
+
 def sync_daily_batch(symbols: list[str],
                      count: int | None = None,
                      batch_size: int | None = None,
@@ -222,34 +289,104 @@ def sync_and_persist_daily_batch(
     on_chunk_done: Callable[[int, int], None] | None = None,
     asset_type: AssetType | str = "stock",
     failed_out: list[str] | None = None,
+    zero_row_out: list[str] | None = None,
 ) -> int:
     """批量同步日 K 并落到 Parquet。返回写入的行数。
 
     start_date/end_date: 外部传入的时间范围(由 pipeline 根据已有数据计算)。
     未传入时默认拉最近 1 年。
+    asset_type: 资产类型。自定义源按 ``daily_asset_types`` 声明决定是否接管,
+                未声明或不覆盖该资产类型时保留既有 TickFlow 路由。
+    failed_out: 可选出参。本轮数据源报错未取到的标的按调用方原始写法追加进该 list,
+                供上层判定「部分失败」而非静默当成功。
+    zero_row_out: 可选出参。本轮实际入库 0 行的标的(含无法识别被跳过的裸符号、
+                  上游 200 空 payload 的静默 0 行)按调用方原始写法追加进该 list,
+                  供上层 fail-loud 展示, 不再"显示成功实则全空" (#302)。
     """
+    seen: set[str] = set()
+    failed_syms: list[str] = []
+    skipped_bare: list[str] = []
+
+    def _finalize(written: int) -> int:
+        if failed_syms and failed_out is not None:
+            failed_out.extend(orig_by_full.get(s, s) for s in failed_syms)
+        zero_full = [s for s in requested if s not in seen and s not in failed_syms]
+        if zero_full or skipped_bare:
+            zero = [orig_by_full.get(s, s) for s in zero_full] + skipped_bare
+            logger.warning(
+                "日K批量同步: %d/%d 标的本轮入库 0 行 (符号无法识别/停牌/窗口内无数据; 样例: %s)",
+                len(zero), len(requested) + len(skipped_bare), zero[:10])
+            if zero_row_out is not None:
+                zero_row_out.extend(zero)
+        return written
+
+    original = list(symbols)
+    symbols, resolved, skipped_bare = _normalize_bare_symbols(symbols, repo.store.data_dir)
+    requested = symbols
+    # 完整符号 → 调用方原始写法: 0 行回报用用户输入的形式, 裸符号也能对上
+    orig_by_full: dict[str, str] = {}
+    for orig in original:
+        orig_by_full.setdefault(resolved.get(orig, orig), orig)
+
     if not symbols:
-        return 0
+        return _finalize(0)
 
     provider = _resolve_daily_provider(asset_type)
-    if provider is None and not capset.has(Cap.KLINE_DAILY_BATCH):
-        return 0
+    if provider is not None:
+        end_time = end_date or cn_now()
+        days = count or 365
+        start_time = start_date or (end_time - timedelta(days=days))
+        iter_daily = getattr(provider, "iter_daily", None)
+        if callable(iter_daily):
 
-    limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH, default_batch=100)
+            def _tracking_chunks(chunks):
+                for chunk_df in chunks:
+                    if not chunk_df.is_empty() and "symbol" in chunk_df.columns:
+                        seen.update(chunk_df["symbol"].cast(pl.Utf8).unique().to_list())
+                    yield chunk_df
 
-    end_time = end_date or cn_now()
-    start_time = start_date or (end_time - timedelta(days=365))
+            # 流式 provider: 逐批落 staging, 全部取完再提交正式分区 (内存峰值 = 单批)。
+            return _finalize(_persist_daily_chunks(
+                _tracking_chunks(iter_daily(
+                    symbols,
+                    start_time=start_time,
+                    end_time=end_time,
+                    asset_type=asset_type,
+                    on_chunk_done=on_chunk_done,
+                )),
+                repo,
+            ))
+        kwargs: dict = {
+            "start_time": start_time,
+            "end_time": end_time,
+            "asset_type": asset_type,
+            "on_chunk_done": on_chunk_done,
+        }
+        if getattr(provider, "supports_daily_failure_reporting", False):
+            kwargs["failed_out"] = failed_syms
+        df = provider.get_daily(symbols, **kwargs)
+    else:
+        if not capset.has(Cap.KLINE_DAILY_BATCH):
+            return _finalize(0)
 
-    df = sync_daily_batch(
-        symbols, count=count, batch_size=limit.batch, rpm=limit.rpm,
-        start_time=start_time, end_time=end_time,
-        on_chunk_done=on_chunk_done,
-        asset_type=asset_type,
-        failed_out=failed_out,
-    )
+        limit = resolve_limit(capset, Cap.KLINE_DAILY_BATCH, default_batch=100)
+
+        end_time = end_date or cn_now()
+        start_time = start_date or (end_time - timedelta(days=365))
+
+        df = sync_daily_batch(
+            symbols, count=count, batch_size=limit.batch, rpm=limit.rpm,
+            start_time=start_time, end_time=end_time,
+            on_chunk_done=on_chunk_done,
+            asset_type=asset_type,
+            failed_out=failed_syms,
+        )
+
+    if not df.is_empty() and "symbol" in df.columns:
+        seen.update(df["symbol"].cast(pl.Utf8).unique().to_list())
 
     if df.is_empty():
-        return 0
+        return _finalize(0)
 
     if asset_type == "stock":
         repo.append_daily(df)
@@ -268,8 +405,7 @@ def sync_and_persist_daily_batch(
     except Exception as e:  # noqa: BLE001
         logger.warning("refresh view failed: %s", e)
 
-    return df.height
-
+    return _finalize(df.height)
 
 def _persist_daily_chunks(chunks, repo: KlineRepository) -> int:
     """先把流式 provider 结果写入私有 staging,完整取数后再提交正式分区。"""
@@ -944,12 +1080,13 @@ def sync_minute_batch(
     count: int | None = None,
     batch_size: int | None = None,
     rpm: int | None = None,
-    on_chunk_done: Callable[[int, int, str], None] | None = None,
+    on_chunk_done: Callable[[int, int, str] | None] | None = None,
     segment_trading_days: int = 20,
     on_segment: Callable[[pl.DataFrame], None] | None = None,
     asset_type: AssetType = "stock",
     raise_on_source_error: bool = False,
     failed_out: list[str] | None = None,
+    raw_basis: bool = False,
 ) -> pl.DataFrame:
     """批量拉取多股分钟 K。
 
@@ -985,6 +1122,13 @@ def sync_minute_batch(
         return df
 
     tf = get_client()
+
+    # naive 窗口按北京墙钟解释 (同 _as_beijing): /api/kline/minute-batch 以 naive 北京墙钟
+    # 构造窗口, 直接交给 _datetime_to_ms 会按服务器本地时区换算, UTC 主机上整体晚 8 小时
+    if start_time is not None:
+        start_time = _as_beijing(start_time)
+    if end_time is not None:
+        end_time = _as_beijing(end_time)
 
     # TickFlow count 上限 10000 根/股, 1 天 240 根 → 单次最多约 41 个交易日。
     # 按 segment_trading_days 交易日分段 (交易日→自然日 ×7/5 换算, 含节假日余量)。
@@ -1025,12 +1169,12 @@ def sync_minute_batch(
                         start_time=_datetime_to_ms(cur_start),
                         end_time=_datetime_to_ms(cur_end),
                         count=10000,
-                        adjust="forward",
+                        adjust="none" if raw_basis else "forward",
                         as_dataframe=False, show_progress=False,
                     )
                 else:
                     raw = tf.klines.batch(chunk, period="1m", count=count or 1200,
-                                          adjust="forward",
+                                          adjust="none" if raw_basis else "forward",
                                           as_dataframe=False, show_progress=False)
             except Exception as e:  # noqa: BLE001
                 logger.warning("minute batch fetch failed for %d symbols: %s", len(chunk), e)
@@ -1366,6 +1510,7 @@ def fetch_minute_single(
     asset_type: AssetType = "stock",
     *,
     capset: CapabilitySet,
+    raw_basis: bool = False,
 ) -> pl.DataFrame:
     """实时拉取单股单日分钟 K(不写入本地)。
 
@@ -1398,7 +1543,7 @@ def fetch_minute_single(
             start_time=_datetime_to_ms(start_time),
             end_time=_datetime_to_ms(end_time),
             count=10000,
-            adjust="forward",
+            adjust="none" if raw_basis else "forward",
             as_dataframe=False, show_progress=False,
         )
     except Exception as e:
@@ -1592,8 +1737,10 @@ def sync_and_persist_minute(
     universe_sync: bool = False,
     asset_type: AssetType = "stock",
 ) -> int:
-    """同步分钟 K 并存到 Parquet(前复权价格, SDK 端 adjust=qfq)。返回写入行数。
+    """同步分钟 K 并存到 Parquet。返回写入行数。
 
+    存储口径由基准标记决定 (services/minute_adjust): 存量未迁移 → SDK adjust=qfq
+    前复权 (旧行为); 已迁移 → adjust='none' 原始价落盘, 复权读取时投影。
     使用 start_time / end_time 区间拉取, 确保所有标的覆盖同一时间段。
     on_chunk_done(current, total) 每个 chunk 完成后回调。
     force_full_days=True 时强制回溯 days 自然日 (不增量补, 用于个股补齐历史)。
@@ -1689,6 +1836,7 @@ def sync_and_persist_minute(
         asset_type=asset_type,
         raise_on_source_error=True,
         failed_out=failed_symbols,
+        raw_basis=minute_adjust.minute_basis_is_raw(repo.store.data_dir),
     )
 
     written = written_box[0]
