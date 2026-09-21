@@ -450,6 +450,19 @@ wheels = [
 ]
 
 [[package]]
+name = "eltdx"
+version = "3.2.2"
+source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
+sdist = { url = "https://pypi.tuna.tsinghua.edu.cn/packages/aa/ea/c5c790d3c6e33d1ea83591c21ecd8a217f9a0df24e018e81fd90b03c0aeb/eltdx-3.2.2.tar.gz", hash = "sha256:5ef7c8750feaa26fa001c8e5ee0d5952ba8c424b3745ae7f66661503f1d3b955", size = 841533, upload-time = "2026-09-12T20:53:31.650661Z" }
+wheels = [
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/ec/be/3ad2856b454702530b8f5062392a7246b41c6888854c60c3f7048418895d/eltdx-3.2.2-cp310-abi3-macosx_10_12_x86_64.whl", hash = "sha256:5f4d0c4988f07223b24e775e76c48c4745139cf2fc4038bc4e7047a9e21ddc60", size = 1924474, upload-time = "2026-09-12T20:53:23.616501Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/ed/ce/99fd16af455ff8bf19aa9e8f0124ab41513ec85a92e695db1288102715a8/eltdx-3.2.2-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:20f0a78dff4b2b7c701d288fe80db9b68b1d2662431b95af62084a45b7780b68", size = 1900000, upload-time = "2026-09-12T20:53:25.523666Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/83/8d/0cefebd2debefabb6828b36b5e1fac90a37023a593ee4251393f62aa8356/eltdx-3.2.2-cp310-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:8ddbf8db27812e5df5f2ec274c1e07dc8c3ee093928ac67dbf4b539b9803d8f1", size = 1995162, upload-time = "2026-09-12T20:53:27.010455Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/d6/41/57f06f04d4b453e36502fd34b4e1b0e248a874429569384dff7fb4c445cb/eltdx-3.2.2-cp310-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:e63b763186debe301c51c3c5afbcddb3cc05e4ccd32ec262a7864f7e1e646267", size = 2018281, upload-time = "2026-09-12T20:53:28.406734Z" },
+    { url = "https://pypi.tuna.tsinghua.edu.cn/packages/ae/e3/03be497df28b512599dfabd2da8386c72a5fbbfc82d8d7b55065ffabe1a4/eltdx-3.2.2-cp310-abi3-win_amd64.whl", hash = "sha256:dab450c34388cd43d77a4f1bda039f073fa5abce9733c40be3b61b6d53fdc7f8", size = 1826816, upload-time = "2026-09-12T20:53:30.085604Z" },
+]
+
+[[package]]
 name = "executing"
 version = "2.2.1"
 source = { registry = "https://pypi.tuna.tsinghua.edu.cn/simple" }
@@ -2548,6 +2561,7 @@ backtest = [
     { name = "vectorbt" },
 ]
 desktop = [
+    { name = "eltdx" },
     { name = "packaging" },
     { name = "pywebview" },
 ]
@@ -2565,6 +2579,7 @@ legacy-cpu = [
 requires-dist = [
     { name = "apscheduler", specifier = ">=3.10" },
     { name = "duckdb", specifier = ">=1.0" },
+    { name = "eltdx", marker = "extra == 'desktop'", specifier = ">=3.2,<4" },
     { name = "fastapi", specifier = ">=0.115" },
     { name = "fastexcel", specifier = ">=0.10" },
     { name = "httpx", specifier = ">=0.27" },

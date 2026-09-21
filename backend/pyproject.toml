@@ -61,6 +61,8 @@ backtest = [
 # 启用:`uv sync --extra desktop`
 desktop = [
     "pywebview>=5.0",
+    # eltdx 内置 Provider: 桌面发行包直接携带免费 TCP 客户端，不能依赖运行时 pip。
+    "eltdx>=3.2,<4",
     "packaging>=24",
 ]
 

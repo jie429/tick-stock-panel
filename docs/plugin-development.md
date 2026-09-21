@@ -341,6 +341,19 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - 财务三表、主要指标与公司股本统一映射到 `period_end` / `announce_date` 和项目 canonical 字段,供应商独有数值列同时透传
   - 普通 licence 无 1 分钟能力,不声明 `minute/full_minute`;近年分红接口不覆盖完整配股事件,不声明 `adj_factor`
   - licence 在设置页先探后存,或通过 `MAIRUI_LICENSE` 配置;真实 licence 永不写入代码、清单或测试
+- **`backend/app/plugins/eltdx/`** — eltdx 免费通达信行情协议数据源(runtime: python, 直接复用 [eltdx](https://github.com/electkismet/eltdx) 的 TCP 客户端, 不启动它的 MCP/HTTP 服务, 无 API Key)
+  - 依赖 `eltdx>=3.2,<4`: 桌面发行版由 `desktop` extra 内置(`packaging/tickflow.spec` 里 `collect_all("eltdx")`), 源码/容器安装由插件目录的 `requirements.txt` 经设置页安装。3.0 起上游 API 按命名空间重写, 0.5.x 的扁平接口已全部移除, 不能沿用旧代码
+  - `bridge.py` — 轻量边界: `availability()` 只做导入 + 版本区间 + 实例方法存在性检查(**不探测 TCP 主机**, 插件扫描不能因测速阻塞启动); `create_client()` 不接受任何外部 host, 只用 eltdx 自带默认行情服务器列表, 避免可选源变成任意 TCP 出口
+  - 提供 `daily`(股票/ETF/指数不复权原始日K)、`adj_factor`、`minute`(按标的 1 分钟 OHLCV, 实测历史约 100 个交易日)、`realtime`(A 股 + ETF 全市场快照)、`depth5`
+  - 单位口径: 价格与成交额为元, `volume_lots`/`total_hand` 原生为**手**, 原样透传不再换算; `change_pct`/`amplitude` 统一由 `change_amount/prev_close` 推导成小数制, 不混用上游的百分数属性
+  - 指数成交量差 100 倍: 实测 `000001.SH`/`399001.SZ`/`399006.SZ`/`000016.SH` 的日K `volume_lots` 恰为当日快照 `total_hand` 的 1/100(当日成分股快照之和与指数快照一致), 故指数 K 线成交量 ×100 还原为手; 股票/ETF 无此偏差
+  - 报价协议单请求上限 80 只(超出静默截断, 整批上千只直接断流): `realtime`、指数补拉与 `depth5` 都自行按 80 只切批; 全市场 A 股 + ETF 约 7200 条实测 ~6 秒, 故 `realtime_min_interval = 30`
+  - 五档必须用 `helpers.full_quotes`(快照 + 0x0547 刷新流合并), `quotes.get_snapshots` 只给一档; 补不齐的档位保留 `None`, 绝不伪造成 0
+  - 指数不混入全市场快照: 通达信"指数"代码表含约 3000 只板块/题材指数, `realtime` 只收 A 股 + ETF, 指数走可选协议 `get_realtime_indices` 按需单拉(失败返回 `None`, 让上层保留上轮指数缓存)
+  - K 线分页: `bars.get` 的 `start` 是**相对最新一根的偏移量**且单页上限 800 根, 按窗口起点逐页向前回溯, 带页数上限(82 页 ≈ 1990 年至今日K)与"本页时间不可解析即停止"的兜底
+  - `adj_factor` 推导: 取 `corporate.capital_changes` 的除权除息事件(每 10 股口径 c1=现金分红 c2=配股价 c3=送转股 c4=配股)与事件日前的原始日K收盘价, 按 `参考价 = (前收盘×10 − 现金分红 + 配股×配股价) / (10 + 送转股 + 配股)` 得**单事件**比值; 不使用上游逐日前/后复权仿射系数, 那与"单事件因子 + 管道自行累积"的契约不同构
+  - 不声明 `financial`(上游只有简版财务批量字段)与 `full_minute`(按标的拉取撑不住盘中全市场分钟落盘); `fallback_to_tickflow_on_error: false` 来源隔离, 故障时返回明确空结果
+  - `tests/test_eltdx_provider.py` — 94 个契约测试(单位换算与指数成交量口径、分页方向与页数上限、80 只切批、五档缺档、软失败与 `failed_out`、除权因子公式、能力声明、availability 两态、loader 注册); `tests/test_eltdx_desktop_packaging.py` — 桌面打包静态契约
 - **`backend/app/plugins/stocksdk/`** — Node 型插件, 通过 subprocess 桥接调用 stock-sdk
   - `bridge.py` — Python↔Node 桥接 + availability 检测
   - `bridge.mjs` — Node 端(并发池、重试、SDK 解析)

@@ -330,7 +330,7 @@ def test_api_endpoint_full_minute_usable_follows_preference(monkeypatch):
     _fake_sources(
         monkeypatch,
         [],
-        [{"name": "eltdx", "display_name": "ELTDX", "datasets": ["full_minute"]}],
+        [{"name": "myhttp", "display_name": "MYHTTP", "datasets": ["full_minute"]}],
     )
     for name in (
         "get_realtime_data_provider", "get_daily_data_provider",
@@ -338,10 +338,10 @@ def test_api_endpoint_full_minute_usable_follows_preference(monkeypatch):
         "get_adj_factor_provider", "get_financial_provider",
     ):
         monkeypatch.setattr(preferences, name, lambda: "tickflow")
-    monkeypatch.setattr(preferences, "get_full_minute_data_provider", lambda: "eltdx")
+    monkeypatch.setattr(preferences, "get_full_minute_data_provider", lambda: "myhttp")
     monkeypatch.setattr(policy, "base_tier_name", lambda: "pro")
 
     fm = _by_id(settings_api.get_capability_matrix())["full_minute"]
-    assert fm["effective"] == "eltdx"
+    assert fm["effective"] == "myhttp"
     assert fm["usable"] is True
     assert fm["tf_available"] is False
