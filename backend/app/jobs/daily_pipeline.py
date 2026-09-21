@@ -23,7 +23,8 @@ from apscheduler.triggers.interval import IntervalTrigger
 from app.config import settings
 from app.indicators.pipeline import filter_halt_days, run_pipeline
 from app.market_time import cn_now, cn_today
-from app.services import index_sync, instrument_sync, kline_sync, preferences as _prefs
+from app.services import index_sync, instrument_sync, kline_sync
+from app.services import preferences as _prefs
 from app.tickflow.capabilities import Cap, CapabilitySet
 from app.tickflow.pools import DEMO_SYMBOLS, get_pool
 from app.tickflow.repository import KlineRepository
@@ -229,6 +230,8 @@ def run_now(
     #   无任何数据 → batch K-line API 拉首次 1 年
     from datetime import date as _date, timedelta as _td, datetime as _dt
     latest_daily = repo.latest_daily_date()
+    # 管道「今天」必须是北京日期: 美西主机 15:35 北京时间仍是本地昨天,
+    # date.today() 会把昨日日K当成已齐, 当日官方收盘价永远拉不进来。
     today = cn_today()
     today_exists = latest_daily and latest_daily >= today
     new_daily_days = 0
