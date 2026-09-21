@@ -851,8 +851,8 @@ def update_data_providers(req: DataProvidersIn, request: Request) -> dict:
     updates = req.model_dump(exclude_none=True)
 
     # Only allow a provider for a dataset it currently declares and loads. This
-    # prevents tdx_mcp from being selected for realtime/financial and reaching
-    # a legacy TickFlow fallback. Existing isolated preferences still stay
+    # prevents a custom provider from being selected for realtime/financial and
+    # reaching a legacy TickFlow fallback. Existing isolated preferences still stay
     # fail-closed during a dependency failure; this only rejects new invalid writes.
     normalized_updates: dict[str, str] = {}
     for field, raw_provider in updates.items():

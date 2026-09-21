@@ -89,7 +89,7 @@ def test_minute_custom_source_grants_minute_batch(monkeypatch):
 
 def test_depth5_builtin_provider_grants_depth_batch(monkeypatch):
     """选中声明 depth5 的内置插件时, 旧能力门控也必须放行。"""
-    _set_providers(monkeypatch, depth5="tdx_mcp")
+    _set_providers(monkeypatch, depth5="mairui")
     _set_datasets(monkeypatch, {"depth5"})
     capset = CapabilitySet()
     _augment_custom_sources(capset)
@@ -188,7 +188,7 @@ def test_update_depth5_provider_syncs_runtime_after_capability_refresh(monkeypat
 
     def sync_provider_change() -> None:
         events.append("sync")
-        assert current["depth5"] == "tdx_mcp"
+        assert current["depth5"] == "mairui"
         assert request.app.state.capabilities is refreshed_capset
 
     depth_service.sync_provider_change.side_effect = sync_provider_change
@@ -202,7 +202,7 @@ def test_update_depth5_provider_syncs_runtime_after_capability_refresh(monkeypat
     monkeypatch.setattr(preferences, "get_financial_provider", lambda: current["financial"])
     monkeypatch.setattr(
         "app.data_providers.custom.provider_has_dataset",
-        lambda name, dataset: name == "tdx_mcp" and dataset == "depth5",
+        lambda name, dataset: name == "mairui" and dataset == "depth5",
     )
     monkeypatch.setattr(
         settings_api,
@@ -211,7 +211,7 @@ def test_update_depth5_provider_syncs_runtime_after_capability_refresh(monkeypat
     )
 
     settings_api.update_data_providers(
-        settings_api.DataProvidersIn(depth5_data_provider="tdx_mcp"),
+        settings_api.DataProvidersIn(depth5_data_provider="mairui"),
         request,
     )
 
@@ -282,12 +282,12 @@ def test_update_depth5_provider_failure_aborts_depth_transition(monkeypatch):
     )
     monkeypatch.setattr(
         "app.data_providers.custom.provider_has_dataset",
-        lambda name, dataset: name == "tdx_mcp" and dataset == "depth5",
+        lambda name, dataset: name == "mairui" and dataset == "depth5",
     )
 
     with pytest.raises(RuntimeError, match="save failed"):
         settings_api.update_data_providers(
-            settings_api.DataProvidersIn(depth5_data_provider="tdx_mcp"),
+            settings_api.DataProvidersIn(depth5_data_provider="mairui"),
             request,
         )
 
@@ -304,8 +304,8 @@ def test_update_depth5_provider_failure_aborts_depth_transition(monkeypatch):
         ("financial_data_provider", "financial"),
     ],
 )
-def test_update_data_providers_rejects_tdx_for_undeclared_dataset(monkeypatch, field, dataset):
-    """设置端拒绝未声明的 TDX 数据集, 避免下游静默走 TickFlow。"""
+def test_update_data_providers_rejects_custom_source_for_undeclared_dataset(monkeypatch, field, dataset):
+    """设置端拒绝未声明的自定义源数据集, 避免下游静默走 TickFlow。"""
     from fastapi import HTTPException
 
     from app.api import settings as settings_api
@@ -320,12 +320,12 @@ def test_update_data_providers_rejects_tdx_for_undeclared_dataset(monkeypatch, f
 
     with pytest.raises(HTTPException) as exc_info:
         settings_api.update_data_providers(
-            settings_api.DataProvidersIn(**{field: "tdx_mcp"}),
+            settings_api.DataProvidersIn(**{field: "mairui"}),
             MagicMock(),
         )
 
     assert exc_info.value.status_code == 422
-    assert calls == [("tdx_mcp", dataset)]
+    assert calls == [("mairui", dataset)]
     saved.assert_not_called()
 
 
@@ -341,13 +341,13 @@ def test_install_selected_plugin_refreshes_capabilities_and_depth_runtime(monkey
     request.app.state.depth_service = depth_service
     depth_service.begin_provider_change.side_effect = lambda: events.append("begin")
     depth_service.sync_provider_change.side_effect = lambda: events.append("sync")
-    monkeypatch.setattr("app.data_providers.custom.is_builtin", lambda name: name == "tdx_mcp")
+    monkeypatch.setattr("app.data_providers.custom.is_builtin", lambda name: name == "mairui")
     monkeypatch.setattr(
         "app.data_providers.custom.install_plugin",
         lambda name: (events.append("install") or (True, "installed")),
     )
     monkeypatch.setattr("app.data_providers.custom.load_all", lambda: events.append("load"))
-    monkeypatch.setattr(preferences, "get_depth5_data_provider", lambda: "tdx_mcp")
+    monkeypatch.setattr(preferences, "get_depth5_data_provider", lambda: "mairui")
     monkeypatch.setattr(
         settings_api,
         "detect_capabilities",
@@ -355,7 +355,7 @@ def test_install_selected_plugin_refreshes_capabilities_and_depth_runtime(monkey
     )
     monkeypatch.setattr(settings_api, "list_data_sources", lambda: {"plugins": []})
 
-    result = settings_api.install_plugin("tdx_mcp", request)
+    result = settings_api.install_plugin("mairui", request)
 
     assert result["install_ok"] is True
     assert result["install_message"] == "installed"
@@ -377,7 +377,7 @@ def test_update_depth5_provider_fences_tickflow_before_capability_refresh(monkey
         "daily": "tickflow",
         "adj": "tickflow",
         "minute": "tickflow",
-        "depth5": "tdx_mcp",
+        "depth5": "mairui",
         "realtime": "tickflow",
         "financial": "tickflow",
     }

@@ -273,8 +273,8 @@ def _allowed_data_providers() -> set[str]:
 def _selected_data_provider(key: str) -> str:
     """Read a data-provider preference while preserving isolated plugin choices.
 
-    Unknown ordinary values retain the historic TickFlow fallback. A plugin such
-    as tdx_mcp that declares ``fallback_to_tickflow_on_error: false`` keeps its
+    Unknown ordinary values retain the historic TickFlow fallback. A plugin that
+    declares ``fallback_to_tickflow_on_error: false`` keeps its
     selection during dependency failures or reload windows, so callers can fail
     closed. This only applies to datasets actually declared by that plugin.
     """

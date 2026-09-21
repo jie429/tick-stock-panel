@@ -214,7 +214,7 @@ def sync_daily_batch(symbols: list[str],
     """
     provider = _resolve_daily_provider(asset_type)
     if provider is not None:
-        # sync_daily_batch 的 ``count`` 语义是回溯固定窗口; 不要让 TDX 在常规页面
+        # sync_daily_batch 的 ``count`` 语义是回溯固定窗口; 不要让自定义 Provider 在常规页面
         # 请求中因空起止时间变成单标的全历史拉取。
         provider_end = end_time
         provider_start = start_time

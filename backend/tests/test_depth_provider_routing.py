@@ -24,10 +24,10 @@ _VALID_DEPTH = {
 def _configure_custom_depth(monkeypatch, provider) -> None:
     from app.services import preferences
 
-    monkeypatch.setattr(preferences, "get_depth5_data_provider", lambda: "tdx_mcp")
+    monkeypatch.setattr(preferences, "get_depth5_data_provider", lambda: "mairui")
     monkeypatch.setattr(
         "app.data_providers.custom.provider_has_dataset",
-        lambda name, dataset: name == "tdx_mcp" and dataset == "depth5",
+        lambda name, dataset: name == "mairui" and dataset == "depth5",
     )
     monkeypatch.setattr("app.data_providers.custom.get_provider", lambda name: provider)
 
@@ -57,7 +57,7 @@ def test_custom_depth_provider_is_called_without_tickflow_fallback(monkeypatch):
 
 def test_custom_depth_failure_is_fail_closed_and_does_not_call_tickflow(monkeypatch):
     provider = MagicMock()
-    provider.get_depth5.side_effect = RuntimeError("TDX timeout")
+    provider.get_depth5.side_effect = RuntimeError("自定义源超时")
     _configure_custom_depth(monkeypatch, provider)
     monkeypatch.setattr(
         "app.tickflow.client.get_client",
@@ -222,7 +222,7 @@ def test_provider_transition_fence_rejects_tickflow_before_capability_refresh(mo
     """切到 TickFlow 但 capability 尚未刷新时, 过渡栅栏仍必须禁止网络请求。"""
     from app.services import preferences
 
-    current = {"provider": "tdx_mcp"}
+    current = {"provider": "mairui"}
     capset = CapabilitySet()
     capset.grant(Cap.DEPTH5_BATCH, CapabilityLimits(batch=1, rpm=None))
     service = DepthService()
@@ -279,7 +279,7 @@ def test_old_provider_parquet_is_rejected_after_selecting_new_provider(
 
     trade_date = date(2026, 9, 4)
     _write_depth_parquet(tmp_path, trade_date, provider_name="tickflow")
-    monkeypatch.setattr(preferences, "get_depth5_data_provider", lambda: "tdx_mcp")
+    monkeypatch.setattr(preferences, "get_depth5_data_provider", lambda: "mairui")
 
     service = DepthService()
     service.set_repo(SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path)))
@@ -295,11 +295,11 @@ def test_old_provider_parquet_is_rejected_after_selecting_new_provider(
 
 
 def test_provider_epoch_rejects_same_source_snapshot_after_round_trip_switch(monkeypatch, tmp_path):
-    """TDX→TickFlow→TDX 后重启不能把第一次 TDX 的当天 sealed 文件重新当作当前数据。"""
+    """自定义源→TickFlow→自定义源 后重启不能把第一次自定义源的当天 sealed 文件重新当作当前数据。"""
     from app.services import preferences
 
     trade_date = date(2026, 9, 4)
-    current = {"provider": "tdx_mcp"}
+    current = {"provider": "mairui"}
     monkeypatch.setattr(preferences, "get_depth5_data_provider", lambda: current["provider"])
 
     repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
@@ -327,7 +327,7 @@ def test_provider_epoch_rejects_same_source_snapshot_after_round_trip_switch(mon
     monkeypatch.setattr(service, "_notify_depth_updated", lambda _count: None)
     current["provider"] = "tickflow"
     service.sync_provider_change()
-    current["provider"] = "tdx_mcp"
+    current["provider"] = "mairui"
     service.sync_provider_change()
 
     restarted = DepthService()
@@ -342,7 +342,7 @@ def test_provider_epoch_is_renewed_when_intermediate_context_write_fails(monkeyp
     from app.services import preferences
 
     trade_date = date(2026, 9, 4)
-    current = {"provider": "tdx_mcp"}
+    current = {"provider": "mairui"}
     monkeypatch.setattr(preferences, "get_depth5_data_provider", lambda: current["provider"])
 
     repo = SimpleNamespace(store=SimpleNamespace(data_dir=tmp_path))
@@ -376,7 +376,7 @@ def test_provider_epoch_is_renewed_when_intermediate_context_write_fails(monkeyp
 
     current["provider"] = "tickflow"
     service.sync_provider_change()
-    current["provider"] = "tdx_mcp"
+    current["provider"] = "mairui"
     service.sync_provider_change()
 
     assert service._provider_snapshot().context != first_context

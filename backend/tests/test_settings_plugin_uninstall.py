@@ -16,7 +16,7 @@ def test_uninstall_current_depth5_provider_refreshes_caps_and_syncs_runtime(monk
     current = {
         "daily": "tickflow",
         "minute": "tickflow",
-        "depth5": "tdx_mcp",
+        "depth5": "mairui",
         "realtime": "tickflow",
         "financial": "tickflow",
     }
@@ -45,7 +45,7 @@ def test_uninstall_current_depth5_provider_refreshes_caps_and_syncs_runtime(monk
     depth_service.sync_provider_change.side_effect = sync_provider_change
     depth_service.begin_provider_change.side_effect = lambda: events.append("begin")
 
-    monkeypatch.setattr(custom_sources, "is_builtin", lambda name: name == "tdx_mcp")
+    monkeypatch.setattr(custom_sources, "is_builtin", lambda name: name == "mairui")
     monkeypatch.setattr(
         custom_sources,
         "uninstall_plugin",
@@ -65,7 +65,7 @@ def test_uninstall_current_depth5_provider_refreshes_caps_and_syncs_runtime(monk
         lambda *args, **kwargs: (events.append("detect") or refreshed_capset),
     )
 
-    result = settings.uninstall_plugin("tdx_mcp", request)
+    result = settings.uninstall_plugin("mairui", request)
 
     assert saved == [{"depth5_data_provider": "tickflow"}]
     assert events == ["begin", "uninstall", "save", "load", "detect", "sync"]
@@ -81,7 +81,7 @@ def test_failed_uninstall_keeps_provider_and_aborts_depth_transition(monkeypatch
     current = {
         "daily": "tickflow",
         "minute": "tickflow",
-        "depth5": "tdx_mcp",
+        "depth5": "mairui",
         "realtime": "tickflow",
         "financial": "tickflow",
     }
@@ -92,7 +92,7 @@ def test_failed_uninstall_keeps_provider_and_aborts_depth_transition(monkeypatch
     depth_service.begin_provider_change.side_effect = lambda: events.append("begin")
     depth_service.abort_provider_change.side_effect = lambda: events.append("abort")
 
-    monkeypatch.setattr(custom_sources, "is_builtin", lambda name: name == "tdx_mcp")
+    monkeypatch.setattr(custom_sources, "is_builtin", lambda name: name == "mairui")
     monkeypatch.setattr(
         custom_sources,
         "uninstall_plugin",
@@ -108,7 +108,7 @@ def test_failed_uninstall_keeps_provider_and_aborts_depth_transition(monkeypatch
     monkeypatch.setattr(preferences, "get_financial_provider", lambda: current["financial"])
     monkeypatch.setattr(preferences, "save", lambda updates: saved.append(dict(updates)))
 
-    result = settings.uninstall_plugin("tdx_mcp", request)
+    result = settings.uninstall_plugin("mairui", request)
 
     assert result["uninstall_ok"] is False
     assert result["uninstall_message"] == "uninstall failed"

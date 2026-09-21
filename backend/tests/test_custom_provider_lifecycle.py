@@ -13,7 +13,7 @@ def test_close_all_unregisters_before_closing_and_isolates_failures(monkeypatch)
     healthy = MagicMock(name="healthy")
     healthy.name = "healthy"
     monkeypatch.setattr(loader, "_PROVIDERS", {"broken": broken, "healthy": healthy})
-    monkeypatch.setattr(loader, "_PLUGIN_STATUS", {"tdx_mcp": {"name": "tdx_mcp"}})
+    monkeypatch.setattr(loader, "_PLUGIN_STATUS", {"mairui": {"name": "mairui"}})
 
     loader.close_all()
 

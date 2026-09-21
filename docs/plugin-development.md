@@ -132,7 +132,7 @@ services 层零改动即可路由。只实现已声明数据集对应的方法,�
 class MyProvider:
     name = "my_source"
     builtin = True  # 标记为内置(不可被用户编辑/删除)
-    # 可选: 未声明时只覆盖 stock 日K/维表; TDX 等可显式扩展至 index/etf。
+    # 可选: 未声明时只覆盖 stock 日K/维表; 自定义源可显式扩展至 index/etf。
     daily_asset_types = frozenset({"stock"})
     instrument_asset_types = frozenset({"stock"})
     # 仅在 Provider 真正支持全市场分钟落盘时才能设为 True。
@@ -345,16 +345,6 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - `bridge.py` — Python↔Node 桥接 + availability 检测
   - `bridge.mjs` — Node 端(并发池、重试、SDK 解析)
   - `provider.py` — Provider 实现(归一化、分批、错误降级)
-
-- **`backend/app/plugins/tdx_api/`** — 外部 `tdx-api` 服务(通达信协议转 HTTP)的数据源插件(runtime: none, 纯 HTTP 零依赖)
-  - 提供 `daily`(原始不复权日K: 股票/ETF 走 `/api/kline-all/tdx` 裸码, 指数走 `/api/index/all` 带前缀码; 按请求窗口估算 `limit`, 只为缩小响应体, 上游仍先取全量)、`minute`(1 分钟原始K, 上游仅保留最近约 90 个交易日)、`realtime`(股票+ETF 全市场快照, 单批 50 只并发拉取, 轮询下限 30 秒)、`depth5`(五档挂单量)
-  - 可选协议 `get_realtime_indices`: 指数不在上游 A 股代码表内, 快照也不含指数, 故用带前缀的指数码单独补拉(实测 `sh000001`/`sz399006`/`bj899050` 均返回点位, 单位同为厘); 失败返回 `None`, 让上层保留上轮有效指数缓存
-  - 单位口径: K 线价格与成交额上游为**厘** → `/1000` 得元; K 线成交量为手, 原样透传; 盘口 `Amount` 上游为**元**(与 K 线成交额差 1000 倍)、`TotalHand` 为手; 五档挂单量为手
-  - 盘口 K 价的量纲陷阱: 上游 `adjustQuotePrice` 对 3 位小数品种(基金类)把 K 价额外 `÷10`, 与同帧买卖档价差一个数量级 → provider 以同帧档位价作量纲参照还原, 无档位(停牌)时退回基金成员判定
-  - 请求代码必须显式带交易所前缀(`sh600519`): 上游 `AddPrefix` 按代码段猜交易所, 不覆盖 ETF 的 56/58/16 段, 裸码会报"股票代码长度错误"; 响应再按请求顺序逐条校验——上游对不支持的代码会回填占位记录(实测北交所旧代码 `430047`/`830799` 返回 `600839`), 位置或代码对不上即丢弃
-  - 不声明 `adj_factor`(上游无除权事件接口)与 `financial`(无财务报表接口); 指数分钟上游仅 100 条且口径不一致, 同样不声明, 均 fail-closed 回退其他源
-  - `fallback_to_tickflow_on_error: false` 来源隔离; 服务地址默认 `http://127.0.0.1:8080`, 非默认用 `TDX_API_BASE_URL`(.env / 环境变量)覆盖
-  - `tests/test_tdx_api_provider.py` — 48 个契约测试(单位换算、K 价量纲自检、响应位置校验、批切分、软失败、维表、指数补拉、试拉)
 
 ## 路由机制(无需关心, 仅参考)
 

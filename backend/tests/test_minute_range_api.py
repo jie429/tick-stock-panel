@@ -136,7 +136,7 @@ def test_sync_minute_single_maps_source_isolated_failure_to_502(monkeypatch):
     monkeypatch.setattr(
         kline_api.kline_sync,
         "sync_and_persist_minute",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(kline_api.kline_sync.MinuteProviderError("TDX TCP down")),
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(kline_api.kline_sync.MinuteProviderError("上游分钟源连接断开")),
     )
 
     with pytest.raises(HTTPException) as exc_info:

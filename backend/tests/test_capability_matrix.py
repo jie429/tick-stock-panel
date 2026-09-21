@@ -206,20 +206,20 @@ def test_depth5_capability_semantics(monkeypatch):
     """五档可由内置插件提供; YAML 自定义源仍不声明该数据集。"""
     _fake_sources(
         monkeypatch,
-        [{"name": "tdx_mcp", "display_name": "tdx-mcp", "datasets": ["depth5"],
+        [{"name": "mairui", "display_name": "mairui", "datasets": ["depth5"],
           "available": True, "status": "ok"}],
     )
     # pro 档: TickFlow 进候选, 默认路由 tickflow → usable
     cap = _by_id(build_capability_matrix(dict(DEFAULT_CURRENT), tickflow_tier="pro"))["depth5"]
     assert cap["tf_available"] is True
-    assert [c["name"] for c in cap["candidates"]] == ["tickflow", "tdx_mcp"]
+    assert [c["name"] for c in cap["candidates"]] == ["tickflow", "mairui"]
     assert cap["usable"] is True
-    # free 档: TickFlow 未解锁, 但已选 tdx-mcp 时仍可用。
+    # free 档: TickFlow 未解锁, 但已选自定义源时仍可用。
     cap = _by_id(build_capability_matrix(
-        dict(DEFAULT_CURRENT, depth5_data_provider="tdx_mcp"), tickflow_tier="free",
+        dict(DEFAULT_CURRENT, depth5_data_provider="mairui"), tickflow_tier="free",
     ))["depth5"]
     assert cap["tf_available"] is False
-    assert [c["name"] for c in cap["candidates"]] == ["tdx_mcp"]
+    assert [c["name"] for c in cap["candidates"]] == ["mairui"]
     assert cap["usable"] is True
 
 

@@ -166,7 +166,7 @@ def sync_index_instruments(
             etf_parts.append(etf_df)
 
     # 2) 付费补充: 仅 TickFlow 作为当前日 K / 维表来源时, 才用
-    # get_by_universes 补指数。已选 TDX 等 Provider 时必须保持来源隔离, 不能
+    # get_by_universes 补指数。已选自定义 Provider 时必须保持来源隔离, 不能
     # 因本机仍有 TickFlow 权限而隐式混入另一来源的数据。
     if pull_index and preferences.get_daily_data_provider() == "tickflow":
         capset = None

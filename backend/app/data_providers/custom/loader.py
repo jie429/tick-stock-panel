@@ -85,7 +85,7 @@ def close_all() -> None:
     """关闭当前注册的 Provider, 并清空注册表。
 
     reload 与应用退出共用此入口。先摘除全局引用再逐个关闭, 避免任一关闭异常
-    打断后续 Provider 的资源回收; TDX 等带在途调用租约的 Provider 会自行延迟底层
+    打断后续 Provider 的资源回收; 带在途调用租约的 Provider 会自行延迟底层
     client 的实际关闭。
     """
     global _PROVIDERS, _PLUGIN_STATUS
