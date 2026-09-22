@@ -51,6 +51,13 @@ _EX_RIGHTS_CATEGORY = 1
 _INDEX_VOLUME_SCALE = 100.0
 # 代码表 category → 项目 asset_type。
 _INSTRUMENT_CATEGORIES = {"stock": "a_share", "etf": "etf", "index": "index"}
+# 分类行情 (0x054b) 单请求上限 80 条; "沪深A股" = 分类号 6, 实测含沪深北全部 A 股。
+_MARKET_CATEGORY = "沪深A股"
+_MARKET_PAGE_SIZE = 80
+# 全市场约 5600 只 / 70 页, 页数上限只作死循环兜底。
+_MAX_MARKET_PAGES = 200
+# 0x054b 排序字段: 按开盘金额 (= 09:25 集合竞价成交额) 降序。
+_AUCTION_SORT_FIELD = "开盘金额"
 
 _SYMBOL_RE = re.compile(r"^(?P<code>\d{6})\.(?P<exchange>[A-Z]{2})$")
 _TDX_SYMBOL_RE = re.compile(r"^(?P<exchange>sh|sz|bj)(?P<code>\d{6})$", re.IGNORECASE)
@@ -167,6 +174,64 @@ def _scaled(value: Any, scale: float) -> float | None:
     return None if number is None else number * scale
 
 
+def _auction_snapshot_row(record: Any, fetched_ms: int) -> dict | None:
+    """分类行情记录 → 全市场竞价快照行 (项目单位契约)。
+
+    竞价成交量用"竞价额 ÷ 今开 ÷ 100"还原为手: 集合竞价全部以开盘价成交, 该式
+    在实测样本上与上游 09:25 撮合量完全一致 (688008: 529667000 ÷ 230 ÷ 100 =
+    23029 手 = open_volume)。停牌/无竞价成交的行 (open_amount 或 open_price 为 0)
+    返回 None, 不伪造成 0 参与竞价量比。
+    """
+    exchange = str(getattr(record, "exchange", "") or "").strip().lower()
+    code = str(getattr(record, "code", "") or "").strip()
+    try:
+        symbol, _, _ = _from_tdx_symbol(f"{exchange}{code}")
+    except ValueError:
+        return None
+
+    open_price = _finite_float(getattr(record, "open_price", None))
+    prev_close = _finite_float(getattr(record, "pre_close_price", None))
+    auction_amount = _finite_float(getattr(record, "open_amount", None))
+    if not open_price or not auction_amount:
+        return None
+
+    bid1 = _finite_float(getattr(record, "bid1", None))
+    bid_vol1 = _finite_float(getattr(record, "bid_vol1", None))
+    ask_vol1 = _finite_float(getattr(record, "ask_vol1", None))
+    last_price = _finite_float(getattr(record, "last_price", None))
+    return {
+        "symbol": symbol,
+        "open_price": open_price,
+        "prev_close": prev_close,
+        # 涨跌幅统一小数制; 上游同名字段是百分数, 一律自行推导不混用。
+        "open_pct": (open_price - prev_close) / prev_close if prev_close else None,
+        "change_pct": (
+            (last_price - prev_close) / prev_close
+            if last_price is not None and prev_close
+            else None
+        ),
+        "last_price": last_price,
+        "auction_amount": auction_amount,
+        "auction_volume": auction_amount / open_price / 100.0,
+        "bid1": bid1,
+        "ask1": _finite_float(getattr(record, "ask1", None)),
+        "bid_volume1": int(bid_vol1) if bid_vol1 is not None else None,
+        "ask_volume1": int(ask_vol1) if ask_vol1 is not None else None,
+        # 封单额 (元) = 买一价 * 买一量(手) * 100; 未封板时为 0 附近的普通买一挂单额。
+        "seal_amount": (
+            bid1 * bid_vol1 * 100.0
+            if bid1 is not None and bid_vol1 is not None
+            else None
+        ),
+        # 内盘 = 主动卖出量(手), 外盘 = 主动买入量(手), 两者之和即当日成交量。
+        "inside_volume": _finite_float(getattr(record, "inside_dish", None)),
+        "outside_volume": _finite_float(getattr(record, "outer_disc", None)),
+        "amount": _finite_float(getattr(record, "amount", None)),
+        "volume": _finite_float(getattr(record, "total_hand", None)),
+        "timestamp": fetched_ms,
+    }
+
+
 def _volume_scale(asset_type: AssetType | str) -> float:
     """指数 K 线成交量口径修正系数。
 
@@ -175,6 +240,8 @@ def _volume_scale(asset_type: AssetType | str) -> float:
     一致, 即指数 K 线的成交量按"手/100"给出。股票与 ETF 无此偏差, 原样透传。
     """
     return _INDEX_VOLUME_SCALE if str(asset_type).lower() == "index" else 1.0
+
+
 class EltdxProvider:
     """免费通达信行情数据源。
 
@@ -849,6 +916,53 @@ class EltdxProvider:
 
         rows = self._quote_records(quotes, requested, fetched_ms)
         logger.info("eltdx 指数行情拉取完成: %d 条(请求 %d 只)", len(rows), len(requested))
+        return rows
+
+    def get_market_auction_snapshot(self) -> list[dict] | None:
+        """全市场 A 股 09:25 集合竞价终态快照 (可选插件协议)。
+
+        通达信分类行情 (0x054b) 按"开盘金额"降序翻页即可覆盖全市场: 实测 5575
+        只 / 70 页 / 约 4 秒, 一条记录同带竞价成交额、今开、昨收、一档盘口、内盘
+        外盘与封单额, 因此不必按标的逐只拉竞价明细。
+
+        软失败返回 None (调用方保留上轮结果), 成功但全市场无竞价成交返回 [] ——
+        与 ``get_realtime_indices`` 同语义。集合竞价终态 (09:25) 之前上游
+        ``open_amount`` 仍为 0, 本方法会返回 [], 时段判断由调用方负责。
+        """
+        fetched_ms = int(time.time() * 1000)
+        rows: list[dict] = []
+        seen: set[str] = set()
+        try:
+            with self._client_session() as client:
+                start = 0
+                for _ in range(_MAX_MARKET_PAGES):
+                    page = client.quotes.list_by_category(
+                        _MARKET_CATEGORY,
+                        sort_by=_AUCTION_SORT_FIELD,
+                        start=start,
+                        count=_MARKET_PAGE_SIZE,
+                    )
+                    records = list(getattr(page, "records", None) or ())
+                    if not records:
+                        break
+                    for record in records:
+                        row = _auction_snapshot_row(record, fetched_ms)
+                        if row is None or row["symbol"] in seen:
+                            continue
+                        seen.add(row["symbol"])
+                        rows.append(row)
+                    start += len(records)
+                    if len(records) < _MARKET_PAGE_SIZE:
+                        break
+                else:
+                    logger.warning(
+                        "eltdx 全市场竞价扫描达 %d 页上限, 提前停止", _MAX_MARKET_PAGES,
+                    )
+        except Exception as exc:
+            logger.warning("eltdx 全市场竞价扫描失败: %s", exc)
+            return None
+
+        logger.info("eltdx 全市场竞价扫描完成: %d 只(有竞价成交)", len(rows))
         return rows
 
     # ---- 五档盘口 ----

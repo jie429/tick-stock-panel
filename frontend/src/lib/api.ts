@@ -734,6 +734,45 @@ export interface DragonTigerPayload {
   hot_money?: { trade_date?: string | null; count?: number | null; hot_money_items?: DragonTigerHotMoney[] }
 }
 
+// ===== 全市场竞价扫描 (09:25 竞价终态快照 + 竞价量比, 可选数据源协议) =====
+export interface AuctionScanItem {
+  symbol: string
+  name?: string | null
+  open_pct?: number | null          // 开盘涨幅 (小数制)
+  change_pct?: number | null        // 现价涨跌幅 (小数制)
+  open_price?: number | null        // 今开 = 竞价成交价
+  prev_close?: number | null
+  last_price?: number | null
+  auction_amount?: number | null    // 竞价成交额 (元)
+  auction_volume?: number | null    // 竞价成交量 (手, 由竞价额 ÷ 今开 ÷ 100 还原)
+  ratio_volume?: number | null      // 竞价量比 (倍; 无历史基线时 null)
+  ratio_amount?: number | null      // 竞价额比 (倍; 含跨日价差, 供对照)
+  prev_amount_share?: number | null // 竞价额 ÷ 昨日全天成交额 (小数制)
+  seal_amount?: number | null       // 封单额 (元) = 买一价 × 买一量(手) × 100
+  bid1?: number | null
+  ask1?: number | null
+  bid_volume1?: number | null
+  ask_volume1?: number | null
+  inside_volume?: number | null     // 内盘 = 当日主动卖出量 (手)
+  outside_volume?: number | null    // 外盘 = 当日主动买入量 (手)
+  amount?: number | null
+  volume?: number | null
+}
+
+export interface AuctionScanPayload {
+  state: 'ok' | 'not_ready' | 'source_unavailable' | 'no_data'
+  message?: string | null
+  trade_date?: string | null
+  scanned_at?: number | null
+  total?: number                    // 参与扫描 (有竞价成交) 的标的数
+  baseline_date?: string | null     // 竞价量比基线日 (无历史基线为 null)
+  history_days?: number             // 已落盘快照天数
+  ratio_ready?: boolean
+  thresholds?: { min_open_pct?: number; min_ratio?: number }
+  counts?: { scanned?: number; high_open?: number; hits?: number }
+  items?: AuctionScanItem[]
+}
+
 // ===== 盘前风向标 (fuyao 专有, 复盘页) =====
 export interface AuctionBenchmarkItem {
   thscode: string
@@ -3728,6 +3767,16 @@ export const api = {
   /** 盘中异动: enriched 当日信号命中行 (涨停/炸板/翘板/跌停/新高/新低/放量) */
   abnormalIntraday: (limit = 500) =>
     request<AbnormalIntradayPayload>(`/api/abnormal/intraday?limit=${limit}`),
+
+  /**
+   * 全市场竞价扫描: 09:25 集合竞价终态快照 + 竞价量比。
+   * 需「实时行情」数据源实现可选协议 get_market_auction_snapshot (eltdx 支持);
+   * 未实现时 state=source_unavailable, 竞价未结束且无历史快照时 state=not_ready。
+   */
+  abnormalAuctionScan: (minOpenPct = 5, minRatio = 10, limit = 200) =>
+    request<AuctionScanPayload>(
+      `/api/abnormal/auction-scan?min_open_pct=${minOpenPct}&min_ratio=${minRatio}&limit=${limit}`,
+    ),
 
   // ===== Monitor Rules (监控规则) =====
   monitorRulesList: () =>

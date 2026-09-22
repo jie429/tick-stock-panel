@@ -92,6 +92,36 @@ class _Snapshot:
         self.amount = amount
 
 
+class _CategoryRecord:
+    """CategoryQuoteRecord (0x054b): 价格与成交额元, 量为手, 内/外盘为手。
+
+    ``change_pct`` 属性刻意返回上游的百分数口径, 用于断言插件自行推导小数制。
+    """
+
+    def __init__(self, code, exchange="sh", *, open_=10.0, pre=9.5, last=10.2,
+                 open_amount=1.5e7, hand=1234, amount=2.0e7, inside=600, outside=634,
+                 bid1=10.19, bid_vol1=150, ask1=10.21, ask_vol1=90):
+        self.exchange = exchange
+        self.code = code
+        self.open_price = open_
+        self.pre_close_price = pre
+        self.last_price = last
+        self.open_amount = open_amount
+        self.total_hand = hand
+        self.amount = amount
+        self.inside_dish = inside
+        self.outer_disc = outside
+        self.bid1 = bid1
+        self.bid_vol1 = bid_vol1
+        self.ask1 = ask1
+        self.ask_vol1 = ask_vol1
+
+    @property
+    def change_pct(self):
+        """上游口径是百分数 (10.2 = +10.2%), 插件不得透传。"""
+        return 999.0
+
+
 class _Level:
     def __init__(self, volume):
         self.volume = volume
@@ -108,10 +138,13 @@ class _LevelQuote:
 
 
 class _Quotes:
-    def __init__(self, snapshots=(), error=None):
+    def __init__(self, snapshots=(), error=None, category_records=(), category_error=None):
         self.snapshots = list(snapshots)
         self.error = error
         self.calls: list[list[str]] = []
+        self.category_records = list(category_records)
+        self.category_error = category_error
+        self.category_calls: list[dict] = []
 
     def get_snapshots(self, codes):
         self.calls.append(list(codes))
@@ -119,6 +152,21 @@ class _Quotes:
             raise self.error
         wanted = {str(code).lower() for code in codes}
         return [row for row in self.snapshots if _full_code(row) in wanted]
+
+    def list_by_category(self, category, *, sort_by=None, start=0, count=80, ascending=False):
+        """0x054b 分类行情分页: 记录按 start/count 切片, 末页短页。"""
+        self.category_calls.append({
+            "category": category, "sort_by": sort_by, "start": start,
+            "count": count, "ascending": ascending,
+        })
+        if self.category_error is not None:
+            raise self.category_error
+        return _CategoryPage(self.category_records[start : start + count])
+
+
+class _CategoryPage:
+    def __init__(self, records):
+        self.records = tuple(records)
 
 
 class _Helpers:
@@ -225,9 +273,10 @@ class _Codes:
 class _FakeClient:
     def __init__(self, *, bars=None, bars_error=None, snapshots=(), snapshot_error=None,
                  level_quotes=(), level_error=None, events=None, corporate_error=None,
-                 codes=None, universe_error=None, connect_error=None):
+                 codes=None, universe_error=None, connect_error=None,
+                 category_records=(), category_error=None):
         self.bars = _Bars(bars, bars_error)
-        self.quotes = _Quotes(snapshots, snapshot_error)
+        self.quotes = _Quotes(snapshots, snapshot_error, category_records, category_error)
         self.helpers = _Helpers(level_quotes, level_error)
         self.corporate = _Corporate(events, corporate_error)
         self.codes = codes if codes is not None else _Codes()
@@ -910,6 +959,168 @@ def test_depth5_empty_or_invalid_symbols_return_empty(monkeypatch):
     assert provider.get_depth5([]) == {}
     assert provider.get_depth5(["600519"]) == {}
     assert fake.helpers.calls == []
+
+
+# =====================================================================
+# 全市场竞价扫描 (0x054b 分类行情)
+# =====================================================================
+
+
+def test_market_auction_snapshot_maps_units_and_derives_volume(monkeypatch):
+    """竞价量由"额 ÷ 今开 ÷ 100"还原为手; 涨跌幅自行推导小数制。"""
+    record = _CategoryRecord(
+        "600519", "sh", open_=230.0, pre=210.0, last=222.0, open_amount=529658300.0,
+    )
+    provider = _install(monkeypatch, _FakeClient(category_records=[record]))
+
+    rows = provider.get_market_auction_snapshot()
+
+    assert rows is not None and len(rows) == 1
+    row = rows[0]
+    assert row["symbol"] == "600519.SH"
+    assert row["open_price"] == 230.0
+    assert row["prev_close"] == 210.0
+    assert row["open_pct"] == pytest.approx((230.0 - 210.0) / 210.0)
+    assert row["auction_amount"] == 529658300.0
+    assert row["auction_volume"] == pytest.approx(529658300.0 / 230.0 / 100.0)
+    # 封单额 (元) = 买一价 * 买一量(手) * 100
+    assert row["seal_amount"] == pytest.approx(10.19 * 150 * 100.0)
+    assert row["bid_volume1"] == 150
+    assert row["ask_volume1"] == 90
+    assert row["inside_volume"] == 600.0
+    assert row["outside_volume"] == 634.0
+    assert row["amount"] == 2.0e7
+    assert row["volume"] == 1234.0
+    assert isinstance(row["timestamp"], int) and row["timestamp"] > 0
+
+
+def test_market_auction_snapshot_derives_change_pct_not_upstream_percent(monkeypatch):
+    """上游 change_pct 是百分数 (999.0), 插件必须自己推导小数制。"""
+    provider = _install(monkeypatch, _FakeClient(
+        category_records=[_CategoryRecord("000001", "sz", open_=11.0, pre=10.0, last=11.5)],
+    ))
+
+    row = provider.get_market_auction_snapshot()[0]
+
+    assert row["change_pct"] == pytest.approx(0.15)
+    assert row["open_pct"] == pytest.approx(0.10)
+
+
+def test_market_auction_snapshot_maps_bj_and_lowercase_exchange(monkeypatch):
+    provider = _install(monkeypatch, _FakeClient(
+        category_records=[_CategoryRecord("920107", "BJ")],
+    ))
+    assert provider.get_market_auction_snapshot()[0]["symbol"] == "920107.BJ"
+
+
+def test_market_auction_snapshot_skips_suspended_and_unparsable_rows(monkeypatch):
+    """停牌/无竞价成交 (今开或竞价额为 0) 与异常代码不得进入竞价量比。"""
+    provider = _install(monkeypatch, _FakeClient(category_records=[
+        _CategoryRecord("600000", "sh", open_=0.0, open_amount=0.0),
+        _CategoryRecord("600001", "sh", open_=10.0, open_amount=0.0),
+        _CategoryRecord("600002", "sh", open_=0.0, open_amount=1.0e7),
+        _CategoryRecord("600003", "xx"),
+        _CategoryRecord("6004", "sh"),
+        _CategoryRecord("600004", "sh"),
+    ]))
+
+    rows = provider.get_market_auction_snapshot()
+
+    assert [row["symbol"] for row in rows] == ["600004.SH"]
+
+
+def test_market_auction_snapshot_derives_volume_when_open_price_only(monkeypatch):
+    """竞价额与今开齐全即够还原量; 昨收缺失时涨跌幅留 None, 不伪造成 0。"""
+    provider = _install(monkeypatch, _FakeClient(category_records=[
+        _CategoryRecord("600005", "sh", pre=None, open_=20.0, open_amount=4.0e7),
+    ]))
+
+    row = provider.get_market_auction_snapshot()[0]
+
+    assert row["open_pct"] is None
+    assert row["change_pct"] is None
+    assert row["auction_volume"] == pytest.approx(4.0e7 / 20.0 / 100.0)
+
+
+def test_market_auction_snapshot_uses_market_category_and_open_amount_sort(monkeypatch):
+    fake = _FakeClient(category_records=[_CategoryRecord("600000", "sh")])
+    provider = _install(monkeypatch, fake)
+
+    provider.get_market_auction_snapshot()
+
+    assert ep._MARKET_CATEGORY == "沪深A股"
+    assert ep._AUCTION_SORT_FIELD == "开盘金额"
+    assert fake.quotes.category_calls == [{
+        "category": "沪深A股", "sort_by": "开盘金额", "start": 0, "count": 80,
+        "ascending": False,
+    }]
+
+
+def test_market_auction_snapshot_pages_until_short_page(monkeypatch):
+    """满页继续翻页, 短页即停: 80 + 80 + 12 = 172 只, 只发 3 次请求。"""
+    records = [
+        _CategoryRecord(f"{600000 + index}", "sh")
+        for index in range(172)
+    ]
+    fake = _FakeClient(category_records=records)
+    provider = _install(monkeypatch, fake)
+
+    rows = provider.get_market_auction_snapshot()
+
+    assert len(rows) == 172
+    assert [call["start"] for call in fake.quotes.category_calls] == [0, 80, 160]
+    assert all(call["count"] == ep._MARKET_PAGE_SIZE for call in fake.quotes.category_calls)
+
+
+def test_market_auction_snapshot_stops_on_empty_page(monkeypatch):
+    fake = _FakeClient(category_records=[])
+    provider = _install(monkeypatch, fake)
+
+    assert provider.get_market_auction_snapshot() == []
+    assert len(fake.quotes.category_calls) == 1
+
+
+def test_market_auction_snapshot_is_capped_by_page_limit(monkeypatch):
+    """上游始终回满页时的死循环兜底: 达到页数上限即停, 不无限翻页。"""
+    records = [_CategoryRecord(f"{600000 + index}", "sh") for index in range(20000)]
+    fake = _FakeClient(category_records=records)
+    provider = _install(monkeypatch, fake)
+
+    rows = provider.get_market_auction_snapshot()
+
+    assert len(fake.quotes.category_calls) == ep._MAX_MARKET_PAGES
+    assert rows is not None and len(rows) == ep._MAX_MARKET_PAGES * ep._MARKET_PAGE_SIZE
+
+
+def test_market_auction_snapshot_dedups_overlapping_pages(monkeypatch):
+    """翻页期间行情变动导致同一标的重复出现时只保留一条。"""
+    record = _CategoryRecord("600519", "sh")
+    fake = _FakeClient(category_records=[record] * 200)
+    provider = _install(monkeypatch, fake)
+
+    rows = provider.get_market_auction_snapshot()
+
+    assert [row["symbol"] for row in rows] == ["600519.SH"]
+
+
+def test_market_auction_snapshot_error_returns_none(monkeypatch):
+    """软失败: 分类行情异常返回 None (调用方保留上轮结果), 不抛异常。"""
+    provider = _install(monkeypatch, _FakeClient(category_error=RuntimeError("断流")))
+
+    assert provider.get_market_auction_snapshot() is None
+
+
+def test_market_auction_snapshot_client_unavailable_returns_none(monkeypatch):
+    provider = _install(monkeypatch, _FakeClient(connect_error=RuntimeError("无连接")))
+
+    assert provider.get_market_auction_snapshot() is None
+
+
+def test_market_auction_snapshot_row_helper_requires_amount_and_open(monkeypatch):
+    assert ep._auction_snapshot_row(_CategoryRecord("600000", "sh", open_amount=0.0), 1) is None
+    assert ep._auction_snapshot_row(_CategoryRecord("600000", "sh", open_=0.0), 1) is None
+    assert ep._auction_snapshot_row(_CategoryRecord("600000", "zz"), 1) is None
+    assert ep._auction_snapshot_row(_CategoryRecord("600000", "sh"), 7)["timestamp"] == 7
 
 
 # =====================================================================
