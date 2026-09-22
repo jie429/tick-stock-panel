@@ -11,12 +11,18 @@
   - 行业: https://shy313.com/api/plugins/market_flow/exports/ths-industries
 作者更新数据只需改接口上的 JSON, 用户下次拉取自动同步, 无需发版。
 
+
+第三类预设是「数据源型」(无 HTTP 配方): 数据由 Provider 可选协议现场拉取, 见
+_PROVIDER_PRESETS; 目前只有通达信概念板块 (eltdx 的 get_board_groups)。这类预设
+不在启动时建表, 而是用户首次获取时才创建, 未装该数据源的用户不会多出一张空表。
 接入点: app.main.lifespan → ensure_builtin_presets(store.data_dir)
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import math
+from collections.abc import Callable
 from pathlib import Path
 
 from app.services.ext_data import (
@@ -99,8 +105,47 @@ def _industry_preset() -> ExtConfig:
     )
 
 
+# 数据源型预设: 数据来自 Provider 可选协议, 由 fetch_preset 分流 (不走 HTTP 配方)。
+# 这是预设自己的来源声明, 与 _CONCEPT_DATA_URL 同类 —— 预设本就绑定一个确定来源,
+# 不参与能力矩阵路由; 数据源缺失时报错而不是静默换源。
+_PROVIDER_PRESETS: dict[str, tuple[str, str]] = {"ext_gn_tdx": ("eltdx", "concept")}
+
+
+def _tdx_concept_preset() -> ExtConfig:
+    """通达信概念 (ext_gn_tdx)。
+
+    来源: Provider 可选协议 get_board_groups("concept") → [{symbol, groups}]
+    本地 schema: 股票代码 / 所属概念(分号拼接) / symbol / code
+
+    字段与同花顺概念预设对齐, 因此概念分析 / RPS 轮动 / 概念字段筛选等消费方
+    无需区分两者的来源。
+    """
+    return ExtConfig(
+        id="ext_gn_tdx",
+        label="通达信概念",
+        mode="snapshot",
+        fields=[
+            ExtField("symbol", "string", "标的代码"),
+            ExtField("code", "string", "代码"),
+            ExtField("股票代码", "string", "股票代码"),
+            ExtField("所属概念", "string", "所属概念"),
+        ],
+        description="通达信概念板块成分 (eltdx 数据源; 在概念分析页「从通达信获取」时创建)",
+        symbol_map={"type": "mapped", "col": "股票代码"},
+        code_map={"type": "computed", "from": "symbol", "method": "strip_exchange"},
+        pull=PullConfig(
+            # 无 HTTP 配方: 取数走 Provider 协议; enabled=False 保证 PullScheduler
+            # 不会把它当普通接口表调度 (#199), 手动获取走 fetch_preset 独立路径。
+            url="",
+            method="GET",
+            schedule_minutes=1440,
+            enabled=False,
+        ),
+    )
+
+
 def _presets() -> list[ExtConfig]:
-    return [_concept_preset(), _industry_preset()]
+    return [_concept_preset(), _industry_preset(), _tdx_concept_preset()]
 
 
 # ---------------------------------------------------------------------------
@@ -165,6 +210,23 @@ def _flatten_industry_rows(raw_rows: list[dict]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+def _flatten_board_rows(rows: list[dict]) -> list[dict]:
+    """板块分组: [{symbol, groups}] → 「所属概念」分号拼接 (同花顺概念同 schema)。"""
+    out: list[dict] = []
+    for row in rows:
+        symbol = str(row.get("symbol") or "").strip()
+        groups = [label for g in (row.get("groups") or []) if (label := _dimension_label(g))]
+        if not symbol or not groups:
+            continue
+        out.append({
+            "股票代码": symbol,
+            "所属概念": ";".join(groups),
+            "symbol": symbol,
+            "code": _symbol_to_code(symbol),
+        })
+    return out
+
+
 # 拉取执行 (复用 httpx, 不依赖 fetch_and_ingest 的 PullConfig 路径)
 # ---------------------------------------------------------------------------
 
@@ -247,6 +309,10 @@ async def ensure_builtin_presets(data_dir: Path) -> None:
     store = ExtConfigStore(data_dir)
 
     for config in _presets():
+        if config.id in _PROVIDER_PRESETS:
+            # 数据源型预设不强加: 取数要现场连本机数据源 (实测约 40 秒), 且只在用户
+            # 主动获取时才需要这张表 —— 首次 fetch_preset 会按需创建配置。
+            continue
         existing = store.get(config.id)
         if existing is not None:
             # 用户已有此表 (老用户 / 自己重建过) → 一律不动
@@ -269,13 +335,51 @@ async def fetch_preset(config_id: str, data_dir: Path) -> int:
     if config is None:
         raise ValueError(f"未知的内置预设: {config_id}")
 
-    flatten = _flatten_concept_rows if config_id == "ext_gn_ths" else _flatten_industry_rows
+    provider_ref = _PROVIDER_PRESETS.get(config_id)
+    # 数据源型预设先解析数据源与协议再建配置: 数据源缺失时不该留下一张永远填不满的
+    # 空表 (概念分析页会按 id 顺序默认选中它)。
+    fetch_board = _board_group_fetcher(config, provider_ref) if provider_ref is not None else None
 
     # 确保 config.json 存在 (用户可能从未启动过 ensure_builtin_presets)
     store = ExtConfigStore(data_dir)
     if store.get(config_id) is None:
         store.upsert(config)
 
-    n = await _seed_one(config, flatten, data_dir)
+    if fetch_board is not None:
+        n = await _fetch_provider_preset(config, fetch_board, data_dir)
+    else:
+        flatten = _flatten_concept_rows if config_id == "ext_gn_ths" else _flatten_industry_rows
+        n = await _seed_one(config, flatten, data_dir)
     logger.info("内置扩展表 %s 手动拉取成功: %d 行", config_id, n)
     return n
+
+
+def _board_group_fetcher(config: ExtConfig, ref: tuple[str, str]) -> Callable[[], list[dict] | None]:
+    """解析数据源型预设的取数函数 (数据源缺失/协议缺失都直接报错, 不静默换源)。"""
+    from app.data_providers import custom as custom_sources
+
+    provider_name, kind = ref
+    if not custom_sources.is_custom_provider(provider_name):
+        raise ValueError(f"数据源 {provider_name} 未安装或不可用, 无法获取{config.label}")
+    fetch = getattr(custom_sources.get_provider(provider_name), "get_board_groups", None)
+    if not callable(fetch):
+        raise ValueError(f"数据源 {provider_name} 不提供板块分组协议")
+    return lambda: fetch(kind)
+
+
+async def _fetch_provider_preset(
+    config: ExtConfig, fetch: Callable[[], list[dict] | None], data_dir: Path,
+) -> int:
+    """数据源型预设: 取数走 Provider 可选协议, 不走 HTTP 配方。
+
+    与 HTTP 预设的区别只在取数一步: 结构转换仍收口在本模块, 落盘仍走 rows_to_parquet,
+    因此 schema、合并去重与缓存失效行为与同花顺预设一致。
+    """
+    # 本机 TCP 批量拉取 (实测约 40 秒), 放线程里跑, 不阻塞事件循环
+    rows = await asyncio.to_thread(fetch)
+    if rows is None:
+        raise ValueError(f"{config.label} 拉取失败: 板块分组接口软失败 (数据源不可达或上游变更)")
+    flattened = _flatten_board_rows(rows)
+    if not flattened:
+        raise ValueError(f"{config.label} 拉取失败: 板块分组返回 0 条归属")
+    return rows_to_parquet(flattened, config, data_dir)

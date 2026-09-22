@@ -9,6 +9,6 @@ check: app.plugins.eltdx.bridge:availability
 datasets: [daily, adj_factor, minute, realtime, depth5]
 # 来源隔离: eltdx 不可用时返回明确空结果, 不因本机存在 TickFlow 配置而暗中换源。
 fallback_to_tickflow_on_error: false
-description: "通达信免费行情协议数据源。股票/ETF/指数原始日K、按除权除息事件推导的单事件除权因子、按标的1分钟K(实测约100个交易日)、全市场分批实时快照、五档盘口(缺档保留空值)。实时行情按代码表每批最多80只轮询, 最低30秒; 不提供盘中全市场分钟落盘与历史财务报表。"
+description: "通达信免费行情协议数据源。股票/ETF/指数原始日K、按除权除息事件推导的单事件除权因子、按标的1分钟K(实测约100个交易日)、全市场分批实时快照、五档盘口(缺档保留空值)。实时行情按代码表每批最多80只轮询, 最低30秒; 不提供盘中全市场分钟落盘与历史财务报表。另提供可选协议: 全市场竞价扫描 (get_market_auction_snapshot) 与通达信概念板块分组 (get_board_groups, 实测 269 个板块 / 全量约 40 秒, 供扩展数据预设)。"
 install_hint: 'pip install "eltdx>=3.2,<4"(桌面发行版已内置); 无需 API Key。'
 homepage: "https://github.com/electkismet/eltdx"

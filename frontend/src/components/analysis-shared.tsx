@@ -467,12 +467,15 @@ export function PresetFetchState({
   isLoading,
   error,
   onFetch,
+  secondary,
 }: {
   title: string
   hint: string
   isLoading: boolean
   error: unknown
   onFetch: () => void
+  /** 备选来源 (如概念分组可同时用同花顺/通达信): 渲染为次要按钮, 不传则只显示主按钮 */
+  secondary?: { label: string; isLoading: boolean; onFetch: () => void }
 }) {
   const errMsg = error instanceof Error ? error.message : error ? String(error) : ''
   return (
@@ -481,17 +484,32 @@ export function PresetFetchState({
         <DownloadCloud className="mx-auto h-10 w-10 text-muted" strokeWidth={1.5} />
         <h2 className="mt-4 text-base font-medium text-foreground">{title}</h2>
         <p className="mt-2 text-sm text-secondary leading-relaxed">{hint}</p>
-        <button
-          onClick={onFetch}
-          disabled={isLoading}
-          className="mt-5 inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:brightness-110 disabled:opacity-60"
-        >
-          {isLoading ? (
-            <><RefreshCw className="h-4 w-4 animate-spin" /> 获取中...</>
-          ) : (
-            <><DownloadCloud className="h-4 w-4" /> 获取数据</>
+        <div className="mt-5 flex flex-wrap items-center justify-center gap-2">
+          <button
+            onClick={onFetch}
+            disabled={isLoading}
+            className="inline-flex items-center gap-2 rounded-lg bg-accent px-4 py-2 text-sm font-medium text-white transition-colors hover:brightness-110 disabled:opacity-60"
+          >
+            {isLoading ? (
+              <><RefreshCw className="h-4 w-4 animate-spin" /> 获取中...</>
+            ) : (
+              <><DownloadCloud className="h-4 w-4" /> 获取数据</>
+            )}
+          </button>
+          {secondary && (
+            <button
+              onClick={secondary.onFetch}
+              disabled={secondary.isLoading}
+              className="inline-flex items-center gap-2 rounded-lg border border-border bg-surface px-4 py-2 text-sm font-medium text-foreground transition-colors hover:text-foreground disabled:opacity-60"
+            >
+              {secondary.isLoading ? (
+                <><RefreshCw className="h-4 w-4 animate-spin" /> 获取中...</>
+              ) : (
+                <><DownloadCloud className="h-4 w-4" /> {secondary.label}</>
+              )}
+            </button>
           )}
-        </button>
+        </div>
         {errMsg && (
           <p className="mt-3 flex items-center justify-center gap-1.5 text-xs text-bear">
             <AlertCircle className="h-3.5 w-3.5" /> {errMsg}

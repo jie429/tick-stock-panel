@@ -46,6 +46,10 @@ const COMPUTE_REQUEST_TIMEOUT_MS = 300_000
  *  /day, 后端超时 120s) 必须把这层同步放宽。 */
 const extPullTimeoutMs = (timeoutSeconds?: number) => (timeoutSeconds ?? 30) * 1000 + 10_000
 
+// 内置预设获取可能较长: 通达信概念板块要现场连本机 eltdx 逐板块取成分 (实测约 40 秒),
+// 用默认 30 秒会在后端写盘前后先断开前端连接。
+const PRESET_FETCH_TIMEOUT_MS = 180_000
+
 async function request<T>(path: string, init?: RequestOptions): Promise<T> {
   const { quiet, timeoutMs = DEFAULT_REQUEST_TIMEOUT_MS, ...fetchInit } = init ?? {}
   const isFormData = fetchInit.body instanceof FormData
@@ -3366,7 +3370,7 @@ export const api = {
   extDataPresetFetch: (id: string) =>
     request<{ status: string; rows: number }>(
       `/api/ext-data/presets/${id}/fetch`,
-      { method: 'POST' },
+      { method: 'POST', timeoutMs: PRESET_FETCH_TIMEOUT_MS },
     ),
 
   extDataDetectFields: (file: File) => {

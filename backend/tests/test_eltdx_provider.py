@@ -9,6 +9,8 @@
 from __future__ import annotations
 
 from datetime import date, datetime, timedelta
+from pathlib import Path
+from types import SimpleNamespace
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -1537,3 +1539,162 @@ def test_test_dataset_defaults_to_shanghai_sample(monkeypatch):
 
 def test_close_without_client_is_safe():
     EltdxProvider().close()
+
+
+# =====================================================================
+# 板块分组 (可选协议 get_board_groups)
+# =====================================================================
+
+
+class _BoardQuoteRow:
+    """BoardQuoteRow: 本协议只取 board_code / board_name。"""
+
+    def __init__(self, board_code, board_name):
+        self.board_code = board_code
+        self.board_name = board_name
+
+
+class _BoardMemberRow:
+    """BoardQuoteRow (成分): 本协议只取 full_code。"""
+
+    def __init__(self, full_code):
+        self.full_code = full_code
+
+
+class _BoardTable:
+    def __init__(self, rows):
+        self.rows = tuple(rows)
+
+
+class _BoardService:
+    """假 BoardService: 按 category 出板块列表, 按 board_code 出成分。"""
+
+    def __init__(self, boards=None, members=None, quote_error=None, member_error=None):
+        self.boards = {str(k): list(v) for k, v in (boards or {}).items()}
+        self.members = {str(k): list(v) for k, v in (members or {}).items()}
+        self.quote_error = quote_error
+        self.member_error = member_error
+        self.category_calls: list[str] = []
+        self.member_calls: list[str] = []
+
+    def board_quotes(self, *, category="概念", refresh=False):
+        self.category_calls.append(category)
+        if self.quote_error is not None:
+            raise self.quote_error
+        rows = [_BoardQuoteRow(code, name) for code, name in self.boards.get(category, ())]
+        return _BoardTable(rows)
+
+    def board_member_quotes(self, board_code, *, refresh=False):
+        self.member_calls.append(board_code)
+        if self.member_error is not None:
+            raise self.member_error
+        return _BoardTable([_BoardMemberRow(code) for code in self.members.get(board_code, ())])
+
+
+def _install_boards(monkeypatch, service, *, fake=None):
+    """假 client + 假 BoardService: 板块协议不走真实 TCP。"""
+    fake_client = fake if fake is not None else _FakeClient()
+    monkeypatch.setattr(eb, "create_client", lambda: fake_client)
+    monkeypatch.setattr(ep, "_board_service", lambda client: service)
+    return EltdxProvider(), fake_client
+
+
+def test_board_groups_maps_members_to_symbols(monkeypatch):
+    """板块 → 成员 折叠成 symbol → 板块名集合; 按 symbol 升序返回。"""
+    service = _BoardService(
+        boards={"概念": [("880515", "通达信88"), ("880513", "海峡西岸")]},
+        members={"880515": ["sz000408", "sh600519"], "880513": ["sh600519"]},
+    )
+    provider, client = _install_boards(monkeypatch, service)
+
+    rows = provider.get_board_groups("concept")
+
+    assert {row["symbol"]: set(row["groups"]) for row in rows} == {
+        "000408.SZ": {"通达信88"},
+        "600519.SH": {"海峡西岸", "通达信88"},
+    }
+    assert [row["symbol"] for row in rows] == sorted(row["symbol"] for row in rows)
+    assert service.category_calls == [ep._BOARD_KINDS["concept"]]
+    assert service.member_calls == ["880515", "880513"]
+    assert client.connect_calls == 1
+    assert client.closed is True
+
+
+def test_board_groups_unsupported_kind_returns_none(monkeypatch):
+    """行业板块的板块定义文件不可下载: 明确返回 None, 不给"成功但空"的假结果。"""
+    service = _BoardService()
+    provider, client = _install_boards(monkeypatch, service)
+
+    assert provider.get_board_groups("industry") is None
+    assert provider.get_board_groups("") is None
+    assert service.category_calls == []
+    assert service.member_calls == []
+    assert client.connect_calls == 0
+
+
+def test_board_groups_skips_blank_names_and_bad_codes(monkeypatch):
+    """空板块名不发成分请求; 非 sh/sz/bj 六码成分直接跳过。"""
+    service = _BoardService(
+        boards={"概念": [("880515", "通达信88"), ("880513", "  "), ("880514", "")]},
+        members={"880515": ["sh600519", "600519.SH", "xx000001", ""]},
+    )
+    provider, _ = _install_boards(monkeypatch, service)
+
+    rows = provider.get_board_groups("concept")
+
+    assert rows == [{"symbol": "600519.SH", "groups": ["通达信88"]}]
+    assert service.member_calls == ["880515"]
+
+
+def test_board_groups_no_boards_returns_empty_list(monkeypatch):
+    service = _BoardService(boards={"概念": []})
+    provider, _ = _install_boards(monkeypatch, service)
+
+    assert provider.get_board_groups("concept") == []
+    assert service.member_calls == []
+
+
+def test_board_groups_soft_failures_return_none(monkeypatch):
+    """板块列表失败 / 成分失败 / 连接失败一律 None (调用方保留已有数据)。"""
+    provider, _ = _install_boards(monkeypatch, _BoardService(quote_error=RuntimeError("断流")))
+    assert provider.get_board_groups("concept") is None
+
+    provider, _ = _install_boards(monkeypatch, _BoardService(boards={"概念": [("880515", "通达信88")]}, member_error=RuntimeError("断流")))
+    assert provider.get_board_groups("concept") is None
+
+    fake = _FakeClient(connect_error=RuntimeError("无连接"))
+    provider, _ = _install_boards(monkeypatch, _BoardService(), fake=fake)
+    assert provider.get_board_groups("concept") is None
+
+
+def test_board_groups_closes_client_on_failure(monkeypatch):
+    """失败路径也要归还 TCP 连接, 不留悬挂客户端。"""
+    fake = _FakeClient()
+    provider, _ = _install_boards(
+        monkeypatch, _BoardService(boards={"概念": [("880515", "通达信88")]}, member_error=RuntimeError("断流")), fake=fake,
+    )
+
+    assert provider.get_board_groups("concept") is None
+    assert fake.closed is True
+
+
+def test_board_service_cache_dir_is_under_data_dir(monkeypatch, tmp_path):
+    """板块定义文件落数据目录, 不用 eltdx 默认的 CWD/downloads。"""
+    pytest.importorskip("eltdx.helpers.boards")
+    from eltdx.helpers import boards as eltdx_boards
+
+    captured = {}
+
+    class _Ctor:
+        def __init__(self, client, *, data_dir=None, definitions_dir=None):
+            captured["data_dir"] = Path(data_dir)
+            captured["client"] = client
+
+    monkeypatch.setattr("app.config.settings", SimpleNamespace(data_dir=tmp_path))
+    monkeypatch.setattr(eltdx_boards, "BoardService", _Ctor)
+
+    sentinel = object()
+    assert isinstance(ep._board_service(sentinel), _Ctor)
+    assert captured["data_dir"] == tmp_path / "cache" / "eltdx_boards"
+    assert captured["data_dir"].is_dir()
+    assert captured["client"] is sentinel

@@ -59,6 +59,12 @@ _MAX_MARKET_PAGES = 200
 # 0x054b 排序字段: 按开盘金额 (= 09:25 集合竞价成交额) 降序。
 _AUCTION_SORT_FIELD = "开盘金额"
 
+# 板块分组 (可选协议 get_board_groups): 通达信概念板块来自 infoharbor_block.dat 的
+# GN_ 段 (实测 269 个板块), 成分要按板块逐个取, 全市场约 5 万条归属 / 约 40 秒。
+# 行业板块的定义文件 (tdxzs.cfg / tdxzs3.cfg) 不在服务器可下载列表内, 只随本机通达信
+# 客户端分发, 所以这里只开放概念; 上层请求其它 kind 一律返回 None, 不猜也不降级。
+_BOARD_KINDS = {"concept": "概念"}
+
 _SYMBOL_RE = re.compile(r"^(?P<code>\d{6})\.(?P<exchange>[A-Z]{2})$")
 _TDX_SYMBOL_RE = re.compile(r"^(?P<exchange>sh|sz|bj)(?P<code>\d{6})$", re.IGNORECASE)
 
@@ -230,6 +236,16 @@ def _auction_snapshot_row(record: Any, fetched_ms: int) -> dict | None:
         "volume": _finite_float(getattr(record, "total_hand", None)),
         "timestamp": fetched_ms,
     }
+
+
+def _board_service(client: Any) -> Any:
+    """构造 eltdx 板块服务 (可选依赖, 延迟导入), 定义文件缓存在数据目录内。"""
+    from app.config import settings
+    from eltdx.helpers import boards as eltdx_boards
+
+    data_dir = settings.data_dir / "cache" / "eltdx_boards"
+    data_dir.mkdir(parents=True, exist_ok=True)
+    return eltdx_boards.BoardService(client, data_dir=data_dir)
 
 
 def _volume_scale(asset_type: AssetType | str) -> float:
@@ -963,6 +979,60 @@ class EltdxProvider:
             return None
 
         logger.info("eltdx 全市场竞价扫描完成: %d 只(有竞价成交)", len(rows))
+        return rows
+
+    def get_board_groups(self, kind: str = "concept") -> list[dict] | None:
+        """板块分组成分 (可选插件协议, 供扩展数据预设等上层使用)。
+
+        kind 目前只支持 ``"concept"``: 通达信概念板块 (infoharbor GN_ 段, 实测 269 个
+        板块)。行业板块的定义文件不在服务器可下载列表内, 因此其它取值返回 None ——
+        明确不支持, 不给"成功但空"的假结果。
+
+        返回 ``[{"symbol": "000001.SZ", "groups": ["概念A", ...]}]``: 按 symbol 升序,
+        groups 去重升序。软失败返回 None (调用方保留已有数据), 与
+        ``get_market_auction_snapshot`` 同语义。实测全量约 40 秒 (逐板块取成分), 属于
+        显式触发的批量拉取, 不要放进实时轮询路径。
+        """
+        category = _BOARD_KINDS.get(kind)
+        if category is None:
+            return None
+        try:
+            client = bridge.create_client()
+        except Exception as exc:
+            logger.warning("eltdx 板块分组客户端创建失败 (%s): %s", kind, exc)
+            return None
+
+        groups_by_symbol: dict[str, set[str]] = {}
+        try:
+            client.connect()
+            service = _board_service(client)
+            table = service.board_quotes(category=category)
+            for board in table.rows:
+                board_name = str(getattr(board, "board_name", "") or "").strip()
+                if not board_name:
+                    continue
+                members = service.board_member_quotes(str(getattr(board, "board_code", "")))
+                for member in members.rows:
+                    try:
+                        symbol = _from_tdx_symbol(str(getattr(member, "full_code", "")))[0]
+                    except ValueError:
+                        continue
+                    groups_by_symbol.setdefault(symbol, set()).add(board_name)
+        except Exception as exc:
+            logger.warning("eltdx 板块分组拉取失败 (%s): %s", kind, exc)
+            return None
+        finally:
+            with suppress(Exception):
+                client.close()
+
+        rows = [
+            {"symbol": symbol, "groups": sorted(groups)}
+            for symbol, groups in sorted(groups_by_symbol.items())
+        ]
+        logger.info(
+            "eltdx 板块分组拉取完成: %s %d 只 / %d 条归属",
+            kind, len(rows), sum(len(g) for g in groups_by_symbol.values()),
+        )
         return rows
 
     # ---- 五档盘口 ----

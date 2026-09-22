@@ -74,6 +74,43 @@ function saveConfig(c: AnalysisFieldConfig) {
   storage.conceptAnalysisConfig.set(c)
 }
 
+/** 概念分组的内置预设: 同花顺在线分类 / 通达信板块成分 (eltdx 可选协议), 二选一即可用。 */
+const CONCEPT_PRESETS: Record<string, { label: string; hint: string }> = {
+  ext_gn_ths: { label: '获取同花顺概念', hint: '同花顺在线接口, 秒级完成' },
+  ext_gn_tdx: { label: '获取通达信概念', hint: '本机 eltdx 数据源, 首次约 40 秒' },
+}
+const DEFAULT_CONCEPT_PRESET = 'ext_gn_ths'
+const isConceptPreset = (id: string) => id in CONCEPT_PRESETS
+
+/**
+ * 概念数据空态: 主来源 = 当前预设, 备选来源 = 另一个内置预设。
+ *
+ * 两个来源写入的是不同 config, 用户选哪个就用哪个; 失败信息由 PresetFetchState 展示
+ * (如未装 eltdx 时点通达信会提示「数据源 eltdx 未安装或不可用」)。
+ */
+function ConceptPresetFetch({ presetId, title, mutation }: {
+  presetId: string
+  title: string
+  mutation: { isPending: boolean; variables?: string; error: unknown; mutate: (id: string) => void }
+}) {
+  const secondaryId = Object.keys(CONCEPT_PRESETS).find(id => id !== presetId)
+  const loading = (id: string) => mutation.isPending && mutation.variables === id
+  return (
+    <PresetFetchState
+      title={title}
+      hint={`概念分组数据来源二选一: ${CONCEPT_PRESETS[presetId]?.hint ?? ''}`}
+      isLoading={loading(presetId)}
+      error={mutation.error}
+      onFetch={() => mutation.mutate(presetId)}
+      secondary={secondaryId ? {
+        label: CONCEPT_PRESETS[secondaryId].label,
+        isLoading: loading(secondaryId),
+        onFetch: () => mutation.mutate(secondaryId),
+      } : undefined}
+    />
+  )
+}
+
 function pickBestConfig(
   configs: { id: string; label: string; description?: string; fields: { name: string; label: string }[] }[],
 ): string {
@@ -266,19 +303,18 @@ export function ConceptAnalysis() {
     enabled: !!activeConfigId,
   })
 
-  // 内置概念预设 (ext_gn_ths) 手动获取数据
-  const PRESET_CONCEPT_ID = 'ext_gn_ths'
+  // 内置概念预设 (同花顺 / 通达信) 手动获取数据
   const queryClient = useQueryClient()
   const fetchMutation = useMutation({
-    mutationFn: () => api.extDataPresetFetch(PRESET_CONCEPT_ID),
-    onSuccess: () => {
+    mutationFn: (presetId: string) => api.extDataPresetFetch(presetId),
+    onSuccess: (_rows, presetId) => {
       queryClient.invalidateQueries({ queryKey: QK.extData })
-      queryClient.invalidateQueries({ queryKey: QK.extDataRows(PRESET_CONCEPT_ID, undefined, PAGE_LIMIT) })
+      queryClient.invalidateQueries({ queryKey: QK.extDataRows(presetId, undefined, PAGE_LIMIT) })
     },
   })
   // 是否处于「内置概念预设存在但无数据」状态 → 显示获取按钮
   const needsConceptFetch =
-    !!activeConfig && activeConfig.id === PRESET_CONCEPT_ID &&
+    !!activeConfig && isConceptPreset(activeConfig.id) &&
     !rowsQuery.isLoading && (rowsQuery.data?.total ?? 0) === 0
 
   const marketQuery = useQuery({
@@ -347,13 +383,7 @@ export function ConceptAnalysis() {
               </button>
             }
           />
-          <PresetFetchState
-            title="暂无概念数据"
-            hint="从同花顺获取概念分类数据后即可使用概念分析"
-            isLoading={fetchMutation.isPending}
-            error={fetchMutation.error}
-            onFetch={() => fetchMutation.mutate()}
-          />
+          <ConceptPresetFetch presetId={DEFAULT_CONCEPT_PRESET} title="暂无概念数据" mutation={fetchMutation} />
         </div>
         <AnimatePresence>
           {showConfig && <AnalysisConfigDialog currentConfig={fieldConfig} onSave={handleSaveConfig} onClose={() => setShowConfig(false)} />}
@@ -423,13 +453,7 @@ export function ConceptAnalysis() {
           ) : rowsQuery.isLoading ? (
             <div className="rounded-2xl border border-border bg-surface px-6 py-16 text-center text-sm text-muted">正在计算概念强度...</div>
           ) : needsConceptFetch ? (
-            <PresetFetchState
-              title="未获取概念数据"
-              hint="内置概念数据源已就绪,点击下方按钮从同花顺获取概念分类数据"
-              isLoading={fetchMutation.isPending}
-              error={fetchMutation.error}
-              onFetch={() => fetchMutation.mutate()}
-            />
+            <ConceptPresetFetch presetId={activeConfig.id} title="未获取概念数据" mutation={fetchMutation} />
           ) : (
             <EmptyState icon={Layers3} title="未匹配到概念数据" hint={resolved.hint || '请检查扩展数据是否包含概念/题材相关字段'} />
           )}

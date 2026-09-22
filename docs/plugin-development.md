@@ -186,6 +186,11 @@ class MyProvider:
         见下文「竞价快照行字段」。失败返回 None (调用方保留上轮落盘结果),
         成功但当日无竞价成交返回 []。"""
 
+    def get_board_groups(self, kind: str = "concept") -> list[dict] | None:
+        """(可选, 板块分组成分) 概念板块成分 → list[dict], 行字段见下文「板块分组行字段」。
+        只定义 kind="concept"; 其它取值返回 None(明确不支持, 不给"成功但空"的假结果),
+        软失败同样返回 None。逐板块取成分属显式触发的批量拉取, 不要放进实时轮询路径。"""
+
     def get_depth5(self, symbols) -> dict:
         """仅内置 Provider：{symbol: {ask_volumes, bid_volumes, timestamp(ms)}}。
         缺档用 None，不得把缺失伪造成 0；调用失败必须返回 {}，不得切换 TickFlow。"""
@@ -270,6 +275,7 @@ class MyProvider:
 | `get_realtime` | **软失败**: 返回 `[]` + warning 日志, 保证轮询线程不中断 |
 | `get_realtime_indices` | **软失败**: 返回 `None` + warning 日志, 保留上轮有效缓存; 成功无数据返回 `[]` |
 | `get_market_auction_snapshot` | **软失败**: 返回 `None` + warning 日志, 服务回退到上一份落盘快照; 成功但全市场无竞价成交返回 `[]` |
+| `get_board_groups` | **软失败**: 返回 `None` + warning 日志, 调用方保留已有归属数据; 不支持的 `kind` 同样返回 `None`, 不降级成别的分类 |
 | `get_depth5` | 单批异常由服务隔离；不跨数据源回退 |
 | `get_minute` | 默认抛异常时调用方回退 TickFlow；设 `fallback_to_tickflow_on_error = False` 时 fail-closed |
 | `get_daily` / `get_adj_factors` / `get_financials` | 异常由上层同步流程捕获记录; 无数据返回空 DataFrame |
@@ -319,6 +325,20 @@ class MyProvider:
 
 服务层 (`app/services/auction_scan.py`) 负责按日落盘、竞价量比与筛选, 插件只做单位
 归一: 竞价量比 = 今日竞价量 ÷ 上一可得快照日竞价量, 首日无基线时不筛量比。
+
+### get_board_groups 行字段
+
+板块分组成分(可选协议)按标的返回一行, 供扩展数据预设等上层折叠成「所属概念 / 所属行业」
+这类维度字段。`kind` 是分类标识, 目前只定义 `"concept"`(通达信概念板块, 实测 269 个
+板块 / 约 5 万条归属)。不支持的取值返回 `None`, 不用空数组冒充"成功但空"。
+
+| 字段 | 必需 | 契约 |
+| --- | --- | --- |
+| `symbol` | ✅ | 标准代码带后缀(上游给 `sh600000` 这类代码时要自行归一) |
+| `groups` | ✅ | 该标的所属板块名列表; 无归属的标的不返回, 不返回 `groups` 为空的残行 |
+
+服务层 (`app/services/ext_presets.py`) 把 `groups` 用 `;` 拼成「所属概念」列, 与同花顺概念
+预设同 schema, 因此消费方(概念分析 / RPS 轮动 / 信号筛选)不区分来源。
 
 ### config.datasets 的作用
 
@@ -379,12 +399,13 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - 指数成交量差 100 倍: 实测 `000001.SH`/`399001.SZ`/`399006.SZ`/`000016.SH` 的日K `volume_lots` 恰为当日快照 `total_hand` 的 1/100(当日成分股快照之和与指数快照一致), 故指数 K 线成交量 ×100 还原为手; 股票/ETF 无此偏差
   - 报价协议单请求上限 80 只(超出静默截断, 整批上千只直接断流): `realtime`、指数补拉与 `depth5` 都自行按 80 只切批; 全市场 A 股 + ETF 约 7200 条实测 ~6 秒, 故 `realtime_min_interval = 30`
   - 全市场竞价扫描走**分类行情** `quotes.list_by_category("沪深A股", sort_by="开盘金额")`(0x054b): 单页 80 条、全市场 5575 只 / 70 页实测 ~4 秒, 一条记录同带竞价成交额、今开、昨收、一档盘口、内盘/外盘与封单额, 不必按标的逐只拉竞价明细。竞价成交量由 `竞价额 ÷ 今开 ÷ 100` 还原为手(集合竞价全部以开盘价成交, 实测与上游 09:25 撮合量一致); 上游 `change_pct` 属性是百分数, 与其它数据集一样自行推导小数制。停牌/无竞价成交(今开或竞价额为 0)的行不进入结果, 不伪造成 0 参与竞价量比。软失败返回 `None`(保留上轮), 页数上限 200 作死循环兜底
+  - 概念板块分组走可选协议 `get_board_groups("concept")`: 板块定义取 `infoharbor_block.dat` 的 GN_ 段(实测 269 个板块), 成分要逐板块取(实测 40 个板块 ≈ 5.7 秒 → 全量约 40 秒 / 约 5 万条归属), 定义文件按日缓存在数据目录 `cache/eltdx_boards/`。只开放概念: 行业板块的定义文件(`tdxzs.cfg` / `tdxzs3.cfg`)不在服务器可下载列表内(只随本机通达信客户端分发), 请求其它 `kind` 一律返回 `None` 而不是猜; 板块名会跨分类重名(如 `通达信88` 在概念与风格里各有一个定义), 所以不做跨分类合并
   - 五档必须用 `helpers.full_quotes`(快照 + 0x0547 刷新流合并), `quotes.get_snapshots` 只给一档; 补不齐的档位保留 `None`, 绝不伪造成 0
   - 指数不混入全市场快照: 通达信"指数"代码表含约 3000 只板块/题材指数, `realtime` 只收 A 股 + ETF, 指数走可选协议 `get_realtime_indices` 按需单拉(失败返回 `None`, 让上层保留上轮指数缓存)
   - K 线分页: `bars.get` 的 `start` 是**相对最新一根的偏移量**且单页上限 800 根, 按窗口起点逐页向前回溯, 带页数上限(82 页 ≈ 1990 年至今日K)与"本页时间不可解析即停止"的兜底
   - `adj_factor` 推导: 取 `corporate.capital_changes` 的除权除息事件(每 10 股口径 c1=现金分红 c2=配股价 c3=送转股 c4=配股)与事件日前的原始日K收盘价, 按 `参考价 = (前收盘×10 − 现金分红 + 配股×配股价) / (10 + 送转股 + 配股)` 得**单事件**比值; 不使用上游逐日前/后复权仿射系数, 那与"单事件因子 + 管道自行累积"的契约不同构
   - 不声明 `financial`(上游只有简版财务批量字段)与 `full_minute`(按标的拉取撑不住盘中全市场分钟落盘); `fallback_to_tickflow_on_error: false` 来源隔离, 故障时返回明确空结果
-  - `tests/test_eltdx_provider.py` — 107 个契约测试(单位换算与指数成交量口径、分页方向与页数上限、80 只切批、五档缺档、全市场竞价扫描的归一与翻页/页数上限/去重/软失败、除权因子公式、能力声明、availability 两态、loader 注册); `tests/test_eltdx_desktop_packaging.py` — 桌面打包静态契约; `tests/test_auction_scan.py` — 竞价扫描服务契约(状态机、落盘与 TTL 缓存、竞价量比与阈值、名称补全, 全离线)
+  - `tests/test_eltdx_provider.py` — 114 个契约测试(单位换算与指数成交量口径、分页方向与页数上限、80 只切批、五档缺档、全市场竞价扫描的归一与翻页/页数上限/去重/软失败、概念板块分组的折叠与软失败三态、除权因子公式、能力声明、availability 两态、loader 注册); `tests/test_eltdx_desktop_packaging.py` — 桌面打包静态契约; `tests/test_auction_scan.py` — 竞价扫描服务契约(状态机、落盘与 TTL 缓存、竞价量比与阈值、名称补全, 全离线)
 - **`backend/app/plugins/stocksdk/`** — Node 型插件, 通过 subprocess 桥接调用 stock-sdk
   - `bridge.py` — Python↔Node 桥接 + availability 检测
   - `bridge.mjs` — Node 端(并发池、重试、SDK 解析)
