@@ -20,6 +20,9 @@ export const QK = {
   quoteInterval:  ['quote-interval'] as const,
   overviewMarket: (asOf?: string) => ['overview-market', asOf ?? 'latest'] as const,
   indexQuotes:    ['index-quotes'] as const,
+  // 个股盘口 (五档价 + 量, 可选成交方向) — 详情弹窗按需拉取, 交易时段自带 15s 轮询;
+  // 不进 SSE_INVALIDATE_PREFIXES: 行情 tick 最短 1s 一次, 失效会让盘口高频重拉上游。
+  quoteBook:      (symbol: string) => ['quote-book', symbol] as const,
 
   // Watchlist
   watchlist:            ['watchlist'] as const,

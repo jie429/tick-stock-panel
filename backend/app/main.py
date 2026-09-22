@@ -40,6 +40,7 @@ from app.api import (
     watchlist,
 )
 from app.api import auth as auth_api
+from app.api import quote as quote_api
 from app.api import settings as settings_api
 from app.api.routes import router as core_router
 from app.config import settings
@@ -481,6 +482,7 @@ app.include_router(backtest.router)
 app.include_router(factors.router)
 app.include_router(mining.router)
 app.include_router(intraday.router)
+app.include_router(quote_api.router)
 app.include_router(indices.router)
 app.include_router(overview.router)
 app.include_router(abnormal.router)

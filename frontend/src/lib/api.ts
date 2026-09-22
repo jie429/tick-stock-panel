@@ -763,6 +763,32 @@ export interface AuctionScanItem {
   volume?: number | null
 }
 
+// ===== 个股盘口 (五档价 + 量, 可选成交方向) =====
+/** 个股盘口卡片数据: 五档买卖报价 (价 + 量) 与当日成交方向 (内盘/外盘)。 */
+export interface QuoteBook {
+  /** 卖一→卖五价 (元/档); 数据源未提供价格为 undefined/null, 缺档为 null */
+  ask_prices?: (number | null)[] | null
+  /** 卖一→卖五量 (手); 缺档为 null (不补 0) */
+  ask_volumes: (number | null)[]
+  bid_prices?: (number | null)[] | null
+  /** 买一→买五量 (手) */
+  bid_volumes: (number | null)[]
+  /** 盘口快照时间 (毫秒时间戳) — 说明这份盘口是哪一刻的 */
+  timestamp: number
+  /** 内盘 = 当日主动卖出量 (手); 数据源未提供成交方向时缺省 */
+  inside_volume?: number | null
+  /** 外盘 = 当日主动买入量 (手) */
+  outside_volume?: number | null
+}
+
+/** GET /api/quote/book 响应: book=null 表示当前拿不到盘口 (非交易时段/停牌/失败) */
+export interface QuoteBookResponse {
+  symbol: string
+  /** 五档盘口能力路由是否已配好 (false 时应引导去配置数据源) */
+  available: boolean
+  book: QuoteBook | null
+}
+
 export interface AuctionScanPayload {
   state: 'ok' | 'not_ready' | 'source_unavailable' | 'no_data'
   message?: string | null
@@ -2449,6 +2475,9 @@ export const api = {
     request<{ rows: IndexQuote[]; count: number }>(
       `/api/intraday/indices${symbols?.length ? `?symbols=${encodeURIComponent(symbols.join(','))}` : ''}`,
     ),
+  /** 个股盘口 (五档价 + 量 + 成交方向); 仅个股详情打开时按需调用, 不参与盘中轮询 */
+  quoteBook: (symbol: string) =>
+    request<QuoteBookResponse>(`/api/quote/book?symbol=${encodeURIComponent(symbol)}`),
   updateRealtimeMonitorConfig: (cfg: {
     sse_refresh_pages?: Record<string, boolean>
     strategy_monitor_enabled?: boolean

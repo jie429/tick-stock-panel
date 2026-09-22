@@ -7,7 +7,10 @@ eltdx 自身可作 MCP / HTTP 服务运行; 项目后端不依赖外部进程, �
 - ``adj_factor`` 由除权除息事件按交易所公式推导的单事件比值, 与 fuyao 同口径;
 - ``minute``    按标的 1 分钟 OHLCV, 实测历史约 100 个交易日;
 - ``realtime``  全市场 A 股 + ETF 快照 (TCP 报价单请求上限 80 只, 自行分批);
-- ``depth5``    五档盘口, 缺档保留 None。
+- ``depth5``    五档盘口 (五档价 + 量), 缺档保留 None。
+
+另提供两个可选协议 (不在 datasets 声明内, 由上层按需鸭子类型调用):
+``get_board_groups`` 通达信概念板块分组, ``get_trade_flow`` 成交方向 (内盘/外盘)。
 
 不声明 ``financial``(上游只有简版财务批量字段)与 ``full_minute``(按标的拉取,
 承受不了盘中全市场分钟落盘)。
@@ -172,6 +175,17 @@ def _level_numbers(levels: Any) -> list[int | None]:
     for level in list(levels or [])[:5]:
         value = _finite_float(getattr(level, "volume", None))
         values.append(int(value) if value is not None else None)
+    return (values + [None] * 5)[:5]
+
+
+def _level_prices(levels: Any) -> list[float | None]:
+    """五档价 (元/档, 缺档保留 None) —— 与 `_level_numbers` 同一档位口径。
+
+    价与量必须同源于一次盘口快照: 档位缺失时两者一起置 None, 不用 0 或昨收凑数。
+    """
+    values: list[float | None] = []
+    for level in list(levels or [])[:5]:
+        values.append(_finite_float(getattr(level, "price", None)))
     return (values + [None] * 5)[:5]
 
 
@@ -1077,9 +1091,59 @@ class EltdxProvider:
             result[symbol] = {
                 "ask_volumes": _level_numbers(getattr(quote, "sell_levels", None)),
                 "bid_volumes": _level_numbers(getattr(quote, "buy_levels", None)),
+                "ask_prices": _level_prices(getattr(quote, "sell_levels", None)),
+                "bid_prices": _level_prices(getattr(quote, "buy_levels", None)),
                 "timestamp": fetched_ms,
             }
         return result
+
+    # ---- 成交方向 ----
+    def get_trade_flow(self, symbols: list[str]) -> dict[str, dict]:
+        """成交方向 (可选协议): 当日主动买/卖量 (手), 供个股盘口卡片等上层使用。
+
+        通达信快照自带内盘 (``inside_dish`` = 主动卖出量) 与 外盘 (``outer_disc`` =
+        主动买入量), 两者之和 ≈ 当日成交量; 与全市场竞价扫描同字段口径, 且是**全日
+        累计**的主动买卖量, 不是逐笔成交方向。
+
+        返回 ``{symbol: {"inside_volume": float|None, "outside_volume": float|None,
+        "timestamp": 毫秒}}``; 与 ``get_depth5`` 同语义: 失败或非法 symbol 严格返回
+        空 dict, 不换源也不把缺失伪造成 0。
+        """
+        if not symbols:
+            return {}
+
+        requested, rejected = self._resolve_requested(symbols)
+        for symbol in rejected:
+            logger.warning("eltdx 成交方向跳过非法 symbol: %s", symbol)
+        if not requested:
+            return {}
+
+        try:
+            with self._client_session() as client:
+                quotes = self._fetch_snapshots(client, list(requested))
+        except Exception as exc:
+            logger.warning("eltdx 成交方向拉取失败(%d 只): %s", len(requested), exc)
+            return {}
+
+        fetched_ms = int(time.time() * 1000)
+        result: dict[str, dict] = {}
+        for quote in quotes:
+            returned = (
+                f"{str(getattr(quote, 'exchange', '')).lower()}"
+                f"{str(getattr(quote, 'code', '')).zfill(6)}"
+            )
+            symbol = requested.get(returned)
+            if symbol is None:
+                logger.warning("eltdx 成交方向忽略未请求的响应: %s", returned)
+                continue
+            result[symbol] = {
+                # 内盘 = 主动卖出量(手), 外盘 = 主动买入量(手), 两者之和即当日成交量。
+                "inside_volume": _finite_float(getattr(quote, "inside_dish", None)),
+                "outside_volume": _finite_float(getattr(quote, "outer_disc", None)),
+                "timestamp": fetched_ms,
+            }
+        return result
+
 
     # ---- 标的维表 ----
     def get_instruments(self, asset_type: AssetType | str = "stock") -> list[dict]:

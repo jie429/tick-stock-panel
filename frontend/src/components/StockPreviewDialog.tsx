@@ -15,6 +15,7 @@ import { StockMultiDayIntradayChart } from '@/components/StockMultiDayIntradayCh
 import { DatePicker } from '@/components/DatePicker'
 import { RuleEditor } from '@/components/monitor/RuleEditor'
 import { PriceAlertDialog } from '@/components/stock-analysis/PriceAlertDialog'
+import { QuoteBookPanel } from '@/components/stock-analysis/QuoteBookPanel'
 import { buildMonitorPriceLines } from '@/lib/price-alerts'
 import { usePreferences } from '@/lib/useSharedQueries'
 import { setFocusSymbol, clearFocusSymbol } from '@/lib/useQuoteStream'
@@ -526,6 +527,9 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, navList
                 </div>
               )
             })()}
+
+            {/* 盘口卡片: 五档价 + 量 与 成交方向 (depth5 能力路由; 不可用时给出配置入口) */}
+            {symbol && <QuoteBookPanel symbol={symbol} />}
 
             {/* 图表内容 — 内衬卡片容器, 图表区与弹窗背景分层 (纯样式) */}
             <div className="flex-1 overflow-auto p-3 sm:p-4">

@@ -82,7 +82,8 @@ class _Snapshot:
     """QuoteSnapshot: 价格元, ``total_hand`` 手, ``change_pct`` 上游为百分数。"""
 
     def __init__(self, code, exchange="sh", *, last=10.0, pre=9.5, open_=9.6,
-                 high=10.2, low=9.4, hand=1234.0, amount=1.2e6):
+                 high=10.2, low=9.4, hand=1234.0, amount=1.2e6,
+                 inside=600, outside=634):
         self.exchange = exchange
         self.code = code
         self.last_price = last
@@ -92,6 +93,9 @@ class _Snapshot:
         self.low_price = low
         self.total_hand = hand
         self.amount = amount
+        # 内盘 = 主动卖出量(手), 外盘 = 主动买入量(手)
+        self.inside_dish = inside
+        self.outer_disc = outside
 
 
 class _CategoryRecord:
@@ -125,18 +129,27 @@ class _CategoryRecord:
 
 
 class _Level:
-    def __init__(self, volume):
+    def __init__(self, volume, price=None):
         self.volume = volume
+        self.price = price
+
+
+def _level(value):
+    """``(价, 量)`` 元组 → 档位; 裸数值只给量 (盘口价缺失的老协议形态)。"""
+    if isinstance(value, (tuple, list)):
+        price, volume = value
+        return _Level(volume, price)
+    return _Level(value)
 
 
 class _LevelQuote:
-    """``helpers.full_quotes`` 返回的五档报价。"""
+    """``helpers.full_quotes`` 返回的五档报价 (价与量同源于一次快照)。"""
 
     def __init__(self, code, exchange="sh", *, bids=(), asks=()):
         self.exchange = exchange
         self.code = code
-        self.buy_levels = tuple(_Level(value) for value in bids)
-        self.sell_levels = tuple(_Level(value) for value in asks)
+        self.buy_levels = tuple(_level(value) for value in bids)
+        self.sell_levels = tuple(_level(value) for value in asks)
 
 
 class _Quotes:
@@ -961,6 +974,100 @@ def test_depth5_empty_or_invalid_symbols_return_empty(monkeypatch):
     assert provider.get_depth5([]) == {}
     assert provider.get_depth5(["600519"]) == {}
     assert fake.helpers.calls == []
+
+
+def test_depth5_carries_prices_with_missing_slots_as_none(monkeypatch):
+    """五档价与量同源于一次快照: 缺档两侧一起 None, 不用 0 或昨收填充。"""
+    fake = _FakeClient(level_quotes=[
+        _LevelQuote(
+            "600519",
+            bids=[(1499.9, 1), (1499.8, 2), None, (1499.6, 4)],
+            asks=[(1500.1, 10), (1500.2, 20)],
+        ),
+    ])
+    provider = _install(monkeypatch, fake)
+
+    row = provider.get_depth5(["600519.SH"])["600519.SH"]
+
+    assert row["bid_prices"] == [1499.9, 1499.8, None, 1499.6, None]
+    assert row["bid_volumes"] == [1, 2, None, 4, None]
+    assert row["ask_prices"] == [1500.1, 1500.2, None, None, None]
+    assert row["ask_volumes"] == [10, 20, None, None, None]
+
+
+def test_depth5_price_missing_stays_none_not_zero(monkeypatch):
+    """上游只回量 (老协议): 价一律 None, 绝不伪造成 0 或昨收价。"""
+    fake = _FakeClient(level_quotes=[_LevelQuote("600519", bids=[1], asks=[2])])
+    provider = _install(monkeypatch, fake)
+
+    row = provider.get_depth5(["600519.SH"])["600519.SH"]
+
+    assert row["bid_prices"] == [None] * 5
+    assert row["ask_prices"] == [None] * 5
+    assert row["bid_volumes"] == [1, None, None, None, None]
+
+
+# =====================================================================
+# 成交方向 (可选协议 get_trade_flow)
+# =====================================================================
+
+
+def test_trade_flow_maps_inside_outside_in_lots(monkeypatch):
+    """内盘 = 主动卖出量, 外盘 = 主动买入量, 上游原生为手, 不再换算。"""
+    fake = _FakeClient(snapshots=[_Snapshot("600519", inside=600, outside=634)])
+    provider = _install(monkeypatch, fake)
+
+    result = provider.get_trade_flow(["600519.SH"])
+
+    assert result["600519.SH"]["inside_volume"] == 600.0
+    assert result["600519.SH"]["outside_volume"] == 634.0
+    assert result["600519.SH"]["timestamp"] > 0
+    assert fake.quotes.calls == [["sh600519"]]
+
+
+def test_trade_flow_batches_by_upstream_limit(monkeypatch):
+    """报价单请求上限 80 只, 超出必须自行切批 (否则静默截断)。"""
+    monkeypatch.setattr(ep, "_QUOTE_BATCH_SIZE", 2)
+    fake = _FakeClient(snapshots=[
+        _Snapshot("600519"),
+        _Snapshot("000001", "sz"),
+        _Snapshot("510300"),
+    ])
+    provider = _install(monkeypatch, fake)
+
+    result = provider.get_trade_flow(["600519.SH", "000001.SZ", "510300.SH"])
+
+    assert [len(call) for call in fake.quotes.calls] == [2, 1]
+    assert set(result) == {"600519.SH", "000001.SZ", "510300.SH"}
+
+
+def test_trade_flow_error_returns_empty_dict(monkeypatch):
+    """取数失败严格返回空: 上层按"成交方向缺失"处理, 不换源也不编造 0。"""
+    fake = _FakeClient(snapshot_error=OSError("断流"))
+    provider = _install(monkeypatch, fake)
+
+    assert provider.get_trade_flow(["600519.SH"]) == {}
+
+
+def test_trade_flow_empty_or_invalid_symbols_return_empty(monkeypatch):
+    fake = _FakeClient(snapshots=[_Snapshot("600519")])
+    provider = _install(monkeypatch, fake)
+
+    assert provider.get_trade_flow([]) == {}
+    assert provider.get_trade_flow(["600519"]) == {}
+    assert fake.quotes.calls == []
+
+
+def test_trade_flow_keeps_none_when_upstream_omits_direction(monkeypatch):
+    """上游未回内外盘时保留 None, 不落成 0 (0 会被读成"无主动成交")。"""
+    fake = _FakeClient(snapshots=[_Snapshot("600519", inside=None, outside=None)])
+    provider = _install(monkeypatch, fake)
+
+    row = provider.get_trade_flow(["600519.SH"])["600519.SH"]
+
+    assert row["inside_volume"] is None
+    assert row["outside_volume"] is None
+    assert row["timestamp"] > 0
 
 
 # =====================================================================

@@ -31,6 +31,7 @@ from dataclasses import dataclass
 from datetime import date
 from datetime import time as dt_time
 from pathlib import Path
+from typing import Any
 from uuid import uuid4
 
 import polars as pl
@@ -77,6 +78,74 @@ class _DepthProviderSnapshot:
 
     context: _DepthProviderContext
     generation: int
+
+
+def _book_number(value: Any) -> float | None:
+    """盘口标量收口: 有限数值之外一律 None (bool 不算数值)。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
+
+
+def _book_levels(value: Any, *, integers: bool) -> list | None:
+    """五档序列收口: 至多 5 档, 数值或 None; 结构非法返回 None (调用方丢弃该段)。
+
+    provider 边界只做类型与长度归一, 不补 0 也不按昨收填充 —— 缺档必须保持可辨认
+    (与封单量同一纪律: 伪造的 0 会被误读成"卖一挂 0 手 = 真封板")。
+    """
+    if not isinstance(value, (list, tuple)) or not value:
+        return None
+    out: list = []
+    for item in list(value)[:5]:
+        if item is None:
+            out.append(None)
+            continue
+        number = _book_number(item)
+        if number is None:
+            return None
+        out.append(int(number) if integers else number)
+    return (out + [None] * 5)[:5]
+
+
+def _book_row(row: dict) -> dict | None:
+    """一次盘口快照 → 个股盘口卡片响应行 (价与量同源)。
+
+    价缺失只留 None (前端显示 —), 量缺失则整行丢弃: 没有量的盘口不可用, 也不能用 0
+    顶替; 时间戳缺失同样丢弃, 否则展示层无法说明这份盘口是哪一刻的。
+    """
+    ask_volumes = _book_levels(row.get("ask_volumes"), integers=True)
+    bid_volumes = _book_levels(row.get("bid_volumes"), integers=True)
+    if ask_volumes is None or bid_volumes is None:
+        return None
+    timestamp = _book_number(row.get("timestamp"))
+    if timestamp is None:
+        return None
+    return {
+        "ask_prices": _book_levels(row.get("ask_prices"), integers=False),
+        "ask_volumes": ask_volumes,
+        "bid_prices": _book_levels(row.get("bid_prices"), integers=False),
+        "bid_volumes": bid_volumes,
+        "timestamp": int(timestamp),
+    }
+
+
+def _validate_trade_flow(data: Any, symbols: list[str], provider_name: str) -> dict[str, dict]:
+    """收口可选协议 get_trade_flow: 只保留请求过、且至少有一侧量的标的。"""
+    if not isinstance(data, dict):
+        logger.warning("depth provider %s 成交方向返回非 dict, 已丢弃", provider_name)
+        return {}
+    result: dict[str, dict] = {}
+    for symbol in symbols:
+        row = data.get(symbol)
+        if not isinstance(row, dict):
+            continue
+        inside = _book_number(row.get("inside_volume"))
+        outside = _book_number(row.get("outside_volume"))
+        if inside is None and outside is None:
+            continue
+        result[symbol] = {"inside_volume": inside, "outside_volume": outside}
+    return result
 
 
 class DepthService:
@@ -582,6 +651,13 @@ class DepthService:
                 "bid_volumes": list(bid_volumes),
                 "timestamp": timestamp,
             }
+            # 五档价是可选扩展 (深度展示用): 缺失/非法只丢价格, 不影响 sealed 依赖的量。
+            for key in ("ask_prices", "bid_prices"):
+                series = _book_levels(row.get(key), integers=False)
+                if series is not None:
+                    result[symbol][key] = series
+                elif row.get(key) is not None:
+                    logger.warning("depth provider %s 的 %s %s 价格非法, 已丢弃", provider_name, symbol, key)
         return result
 
     def _call_depth_batch(self, symbols: list[str]) -> dict:
@@ -892,6 +968,73 @@ class DepthService:
         return None
 
     # ================================================================
+    # 按需盘口 (个股盘口卡片; 不落盘)
+    # ================================================================
+
+    def get_book(self, symbols: list[str]) -> dict[str, dict]:
+        """按需五档盘口 (价 + 量) 与成交方向, 供个股盘口卡片。
+
+        与 sealed 旁路线共用 `_call_depth_batch`: 路由、限速、能力门控和 fail-closed
+        行为完全一致 —— 缺能力或失败返回 `{}`, 绝不回退其它数据源。
+
+        成交方向走可选协议 `get_trade_flow` (内盘/外盘, 手): 数据源未实现时只是少两个
+        字段, 不影响五档; 该调用失败同样只丢成交方向。
+        """
+        if not symbols or not self._has_capability():
+            return {}
+
+        raw = self._call_depth_batch(symbols)
+        if not raw:
+            return {}
+
+        books: dict[str, dict] = {}
+        for symbol in symbols:
+            row = raw.get(symbol)
+            if not isinstance(row, dict):
+                continue
+            book = _book_row(row)
+            if book is not None:
+                books[symbol] = book
+        if not books:
+            return {}
+
+        for symbol, flow in self._fetch_trade_flow(symbols).items():
+            if symbol in books:
+                books[symbol]["inside_volume"] = flow.get("inside_volume")
+                books[symbol]["outside_volume"] = flow.get("outside_volume")
+        return books
+
+    def _fetch_trade_flow(self, symbols: list[str]) -> dict[str, dict]:
+        """可选协议 get_trade_flow; 未实现/失败都返回空, 只影响成交方向。"""
+        snapshot = self._provider_snapshot()
+        provider_name, _ = self._resolve_depth_provider()
+        if provider_name != snapshot.context.name or not self._snapshot_is_current(snapshot):
+            return {}
+        if provider_name == "tickflow":
+            # TickFlow 五档不含内外盘 (MarketDepth 只有价与量), 不臆造。
+            return {}
+
+        from app.data_providers import custom as custom_sources
+
+        try:
+            fetch = getattr(custom_sources.get_provider(provider_name), "get_trade_flow", None)
+        except Exception as exc:
+            logger.warning("depth provider %s 成交方向不可用: %s", provider_name, exc)
+            return {}
+        if not callable(fetch):
+            return {}
+        try:
+            data = fetch(symbols)
+        except Exception as exc:
+            logger.warning(
+                "depth provider %s 成交方向调用失败(%d 只): %s", provider_name, len(symbols), exc,
+            )
+            return {}
+        if not self._snapshot_is_current(snapshot):
+            return {}
+        return _validate_trade_flow(data, symbols, provider_name)
+
+    # ================================================================
     # 盘中轮询线程
     # ================================================================
 
@@ -1055,6 +1198,10 @@ class DepthService:
     # ================================================================
     # 工具
     # ================================================================
+
+    def has_capability(self) -> bool:
+        """对外只读能力查询: API 层据此区分「未配置数据源」与「数据源暂无盘口」。"""
+        return self._has_capability()
 
     def _has_capability(self) -> bool:
         snapshot = self._provider_snapshot()
