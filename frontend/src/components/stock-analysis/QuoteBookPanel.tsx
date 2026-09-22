@@ -4,6 +4,9 @@
  * 数据来自 GET /api/quote/book: 与连板梯队封单走同一条 depth5 能力路由与限速,
  * 单只按需拉取, 不进盘中轮询热路径。
  *
+ * 挂载位置: 只在个股详情弹窗的**分时视图**里 (当日视角), 日K视图不显示 —— 盘口与
+ * 成交方向都是当日实时/当日累计数据, 与历史日K不是同一时间尺度。
+ *
  * 口径与纪律:
  * - 盘口量单位是「手」(数据源原样), 只有封单额才 ×100; 价与量同源于一次快照。
  * - 缺档显示「—」而不补 0 —— 伪造的 0 会被读成「卖一挂 0 手 = 真封板」。
@@ -17,6 +20,7 @@ import { api, type QuoteBook } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { MissingCapChip } from '@/lib/capability-labels'
 import { useQuoteStatus } from '@/lib/useSharedQueries'
+import { cn } from '@/lib/cn'
 import { fmtBigNum, fmtPrice } from '@/lib/format'
 
 /** 交易时段轮询间隔: 五档变化比最新价慢, 15s 足够且省上游配额 */
@@ -89,7 +93,7 @@ export function QuoteBookPanel({ symbol, className = '' }: { symbol: string; cla
   const buyShare = flowTotal > 0 && outside != null ? outside / flowTotal : null
 
   return (
-    <div className={`shrink-0 border-b border-border/60 bg-base/20 px-5 py-1.5 ${className}`}>
+    <div className={cn('rounded border border-border/50 bg-elevated/25 px-3 py-1.5', className)}>
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1">
         <span className="text-[11px] font-semibold text-foreground">盘口</span>
         <span className="text-[9px] text-muted">五档价 / 量(手)</span>

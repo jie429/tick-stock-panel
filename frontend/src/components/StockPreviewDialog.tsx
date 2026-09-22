@@ -528,9 +528,6 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, navList
               )
             })()}
 
-            {/* 盘口卡片: 五档价 + 量 与 成交方向 (depth5 能力路由; 不可用时给出配置入口) */}
-            {symbol && <QuoteBookPanel symbol={symbol} />}
-
             {/* 图表内容 — 内衬卡片容器, 图表区与弹窗背景分层 (纯样式) */}
             <div className="flex-1 overflow-auto p-3 sm:p-4">
               <div className="rounded border border-border/50 bg-base/30 p-3">
@@ -558,6 +555,8 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, navList
                   intradayDays={effectiveIntradayDays}
                   addedDate={addedDate}
                 />
+                {/* 盘口: 五档价/量 + 成交方向 —— 当日实时数据, 只在分时视图与分时图同屏 */}
+                <QuoteBookPanel symbol={symbol} />
                 <StockMultiDayIntradayChart
                   symbol={symbol}
                   days={effectiveIntradayDays}
