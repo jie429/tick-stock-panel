@@ -531,6 +531,7 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, navList
             {/* 图表内容 — 内衬卡片容器, 图表区与弹窗背景分层 (纯样式) */}
             <div className="flex-1 overflow-auto p-3 sm:p-4">
               <div className="rounded border border-border/50 bg-base/30 p-3">
+              {/* 盘口挂在日K右侧分时图旁 (通达信盘口位): 分时图出现时随之显示 */}
               {view === 'daily' ? (
                 <StockPanel
                   symbol={symbol}
@@ -542,8 +543,9 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, navList
                   refetchIntervalMs={intradayRefetchMs}
                   prefetchSymbols={prefetchSymbols}
                   intradayDays={effectiveIntradayDays}
-                  dailyKlineFlex="flex-[1.4]"
+                  dailyKlineFlex="flex-1"
                   addedDate={addedDate}
+                  intradaySidePanel={<QuoteBookPanel symbol={symbol} className="w-[170px]" />}
                 />
               ) : (
                 <div className="flex flex-col gap-3">
@@ -555,20 +557,14 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, navList
                   intradayDays={effectiveIntradayDays}
                   addedDate={addedDate}
                 />
-                {/* 分时图 + 右侧竖排盘口 (通达信盘口位): 盘口是当日实时数据, 只跟分时视图 */}
-                <div className="flex flex-col gap-3 lg:flex-row lg:items-stretch">
-                  <div className="min-w-0 flex-1">
-                    <StockMultiDayIntradayChart
-                      symbol={symbol}
-                      days={effectiveIntradayDays}
-                      height={480}
-                      refetchIntervalMs={intradayRefetchMs}
-                      priceLines={monitorPriceLines}
-                      onPriceDoubleClick={openPriceAlert}
-                    />
-                  </div>
-                  <QuoteBookPanel symbol={symbol} className="w-full shrink-0 lg:w-[200px]" />
-                </div>
+                <StockMultiDayIntradayChart
+                  symbol={symbol}
+                  days={effectiveIntradayDays}
+                  height={480}
+                  refetchIntervalMs={intradayRefetchMs}
+                  priceLines={monitorPriceLines}
+                  onPriceDoubleClick={openPriceAlert}
+                />
                 </div>
               )}
               </div>

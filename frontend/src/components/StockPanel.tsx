@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback, useRef, useMemo } from 'react'
+import { useEffect, useState, useCallback, useRef, useMemo, type ReactNode } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { X } from 'lucide-react'
 import { type KlineRow, type FinancialMetricRecord } from '@/lib/api'
@@ -31,6 +31,11 @@ interface Props {
   priceLines?: ChartPriceLine[]
   showLimitMarkers?: boolean
   showMarkerToggle?: boolean
+  /**
+   * 日K右侧分时图旁的插槽 (传入后在该分时图右边并排渲染, 与分时图等高)。
+   * 典型用法: 个股详情弹窗把盘口面板贴在这个分时图上。仅在分时图显示时渲染。
+   */
+  intradaySidePanel?: ReactNode
   /** 加监控回调 (传入后信息条显示 RadioTower 图标) */
   onMonitor?: () => void
   onPriceDoubleClick?: (price: number, currentPrice: number) => void
@@ -77,6 +82,7 @@ export function StockPanel({
   watchlistPending,
   refetchIntervalMs,
   infoBarOnly = false,
+  intradaySidePanel,
   prefetchSymbols,
   intradayDays = DEFAULT_INTRADAY_DAYS,
   dailyKlineFlex = 'flex-1',
@@ -234,18 +240,24 @@ export function StockPanel({
             >
               <X className="h-3 w-3" />
             </button>
-            <StockIntradayChart
-              symbol={symbol}
-              date={selectedDate}
-              height={height}
-              prevClose={prevClose}
-              dailySummary={selectedRow}
-              onPriceHover={setLinkedPrice}
-              onPriceDoubleClick={onPriceDoubleClick}
-              currentPrice={rows[rows.length - 1]?.close}
-              priceLines={priceLines}
-              refetchIntervalMs={refetchIntervalMs}
-            />
+            {/* 分时图 + 可选侧栏 (个股详情弹窗把盘口贴在这里, 与分时图等高) */}
+            <div className="flex items-stretch gap-3">
+              <div className="min-w-0 flex-1">
+                <StockIntradayChart
+                  symbol={symbol}
+                  date={selectedDate}
+                  height={height}
+                  prevClose={prevClose}
+                  dailySummary={selectedRow}
+                  onPriceHover={setLinkedPrice}
+                  onPriceDoubleClick={onPriceDoubleClick}
+                  currentPrice={rows[rows.length - 1]?.close}
+                  priceLines={priceLines}
+                  refetchIntervalMs={refetchIntervalMs}
+                />
+              </div>
+              {intradaySidePanel && <div className="shrink-0">{intradaySidePanel}</div>}
+            </div>
           </div>
         )}
       </div>
