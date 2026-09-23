@@ -555,16 +555,20 @@ export function StockPreviewDialog({ symbol, name, onClose, triggerInfo, navList
                   intradayDays={effectiveIntradayDays}
                   addedDate={addedDate}
                 />
-                {/* 盘口: 五档价/量 + 成交方向 —— 当日实时数据, 只在分时视图与分时图同屏 */}
-                <QuoteBookPanel symbol={symbol} />
-                <StockMultiDayIntradayChart
-                  symbol={symbol}
-                  days={effectiveIntradayDays}
-                  height={480}
-                  refetchIntervalMs={intradayRefetchMs}
-                  priceLines={monitorPriceLines}
-                  onPriceDoubleClick={openPriceAlert}
-                />
+                {/* 分时图 + 右侧竖排盘口 (通达信盘口位): 盘口是当日实时数据, 只跟分时视图 */}
+                <div className="flex flex-col gap-3 lg:flex-row lg:items-stretch">
+                  <div className="min-w-0 flex-1">
+                    <StockMultiDayIntradayChart
+                      symbol={symbol}
+                      days={effectiveIntradayDays}
+                      height={480}
+                      refetchIntervalMs={intradayRefetchMs}
+                      priceLines={monitorPriceLines}
+                      onPriceDoubleClick={openPriceAlert}
+                    />
+                  </div>
+                  <QuoteBookPanel symbol={symbol} className="w-full shrink-0 lg:w-[200px]" />
+                </div>
                 </div>
               )}
               </div>
