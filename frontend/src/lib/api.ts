@@ -781,6 +781,19 @@ export interface QuoteBook {
   outside_volume?: number | null
 }
 
+/** GET /api/quote/auction 响应: 个股集合竞价读数 (09:25 终态快照 + 竞价量比)。
+
+item=null 表示该日归档里没有这只标的的竞价成交 (停牌/未参与竞价), 按缺失展示。 */
+export interface QuoteAuctionResponse {
+  state: 'ok' | 'not_ready' | 'source_unavailable' | 'no_data'
+  message?: string | null
+  symbol: string
+  trade_date?: string | null           // 该读数所属交易日 (北京时间)
+  baseline_date?: string | null        // 竞价量比基线日 (无历史基线为 null)
+  ratio_ready?: boolean
+  item?: AuctionScanItem | null
+}
+
 /** GET /api/quote/book 响应: book=null 表示当前拿不到盘口 (非交易时段/停牌/失败) */
 export interface QuoteBookResponse {
   symbol: string
@@ -2474,6 +2487,11 @@ export const api = {
   indexQuotes: (symbols?: string[]) =>
     request<{ rows: IndexQuote[]; count: number }>(
       `/api/intraday/indices${symbols?.length ? `?symbols=${encodeURIComponent(symbols.join(','))}` : ''}`,
+    ),
+  /** 个股集合竞价 (09:25 终态快照 + 竞价量比); 分时图竞价柱用, 不参与盘中轮询 */
+  quoteAuction: (symbol: string, date?: string) =>
+    request<QuoteAuctionResponse>(
+      `/api/quote/auction?symbol=${encodeURIComponent(symbol)}${date ? `&date=${encodeURIComponent(date)}` : ''}`,
     ),
   /** 个股盘口 (五档价 + 量 + 成交方向); 仅个股详情打开时按需调用, 不参与盘中轮询 */
   quoteBook: (symbol: string) =>

@@ -23,6 +23,9 @@ export const QK = {
   // 个股盘口 (五档价 + 量, 可选成交方向) — 详情弹窗按需拉取, 交易时段自带 15s 轮询;
   // 不进 SSE_INVALIDATE_PREFIXES: 行情 tick 最短 1s 一次, 失效会让盘口高频重拉上游。
   quoteBook:      (symbol: string) => ['quote-book', symbol] as const,
+  // 个股集合竞价 (09:25 终态快照 + 竞价量比) — 分时图 09:25 竞价柱用。竞价终态当日
+  // 起不再变化, 不进 SSE_INVALIDATE_PREFIXES: 行情 tick 失效只会造成无谓重拉。
+  quoteAuction:   (symbol: string, date: string) => ['quote-auction', symbol, date] as const,
 
   // Watchlist
   watchlist:            ['watchlist'] as const,

@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import * as echarts from 'echarts'
 import type { ECharts, EChartsOption } from 'echarts'
-import type { MinuteKlineRow, PriceLimitInfo } from '@/lib/api'
-import { computeIntradayAverage, formatMinuteTime, FULL_DAY_TIMES, summarizeMinutes, type DailySummary } from '@/lib/intraday-chart'
+import type { AuctionScanItem, MinuteKlineRow, PriceLimitInfo } from '@/lib/api'
+import { AUCTION_TIME, computeIntradayAverage, formatMinuteTime, intradayTimes, summarizeMinutes, type DailySummary } from '@/lib/intraday-chart'
 import { useChartTheme, type ChartTheme } from '@/lib/theme'
 
 type YMode = 'adaptive' | 'limit'
@@ -14,6 +14,21 @@ const THEME = {
   avgLine: '#F59E0B',
   volUp: 'rgba(240,68,56,0.6)',
   volDown: 'rgba(18,183,106,0.6)',
+}
+
+/** 集合竞价开关 (09:25 竞价柱 + 竞价成交比); 不传则不渲染该控件 (指数分时等无竞价场景) */
+export interface AuctionToggle {
+  /** 该交易日的竞价快照条目; null = 该日拿不到竞价 (按钮禁用, 只为展示状态) */
+  item: AuctionScanItem | null
+  /** 竞价量比基线日; null = 无历史基线 (量比显 "—", 不伪造成 0) */
+  baselineDate?: string | null
+  /** 拿不到竞价时的原因 (源未实现协议 / 竞价未结束 / 该标的无竞价成交) */
+  message?: string | null
+  /** 读取中: 按钮不显示"暂无", 避免先闪一次空态 */
+  pending?: boolean
+  /** 是否显示竞价柱 */
+  active: boolean
+  onToggle: () => void
 }
 
 interface Props {
@@ -29,6 +44,8 @@ interface Props {
   priceLines?: { value: number; label?: string; color?: string }[]
   showLimitLines?: boolean
   showAvgLine?: boolean
+  /** 集合竞价开关 (竞价柱 + 竞价成交比), 与主数据同源: 柱由 data 里的 09:25 行决定 */
+  auctionToggle?: AuctionToggle
 }
 
 function fmtAmt(v: number | null | undefined): string {
@@ -40,6 +57,45 @@ function fmtAmt(v: number | null | undefined): string {
 
 function isValidPrice(v: number | null | undefined): v is number {
   return typeof v === 'number' && Number.isFinite(v) && v > 0
+}
+
+/** 倍率展示: 缺基线/缺值显 "—" (竞价量比本身就是 None, 不显示 0 倍) */
+function fmtRatio(v: number | null | undefined): string {
+  return typeof v === 'number' && Number.isFinite(v) ? `${v.toFixed(2)}×` : '—'
+}
+
+/** 悬停柱类型: 09:25 竞价柱与分钟柱口径不同, 标签必须分开 (否则会被读成连续交易那一分钟) */
+function barKindLabel(row: MinuteKlineRow): string {
+  return formatMinuteTime(row.datetime) === AUCTION_TIME
+    ? '集合竞价'
+    : `${formatMinuteTime(row.datetime)} 分钟`
+}
+
+/** 竞价按钮悬浮说明: 竞价口径的一次性交代 (量/额单位: 手 / 元) */
+function auctionTitle(t: AuctionToggle): string {
+  const item = t.item
+  if (!item) {
+    return t.pending ? '集合竞价读取中…' : (t.message ?? '该日无集合竞价数据')
+  }
+  const pct = (v: number | null | undefined) => (
+    typeof v === 'number' && Number.isFinite(v) ? `${(v * 100).toFixed(2)}%` : '—'
+  )
+  return [
+    `集合竞价 09:25 今开 ${isValidPrice(item.open_price) ? item.open_price.toFixed(2) : '—'}`,
+    `开盘涨幅 ${pct(item.open_pct)}`,
+    `竞价量 ${fmtBig(item.auction_volume)}手`,
+    `竞价额 ${fmtAmt(item.auction_amount)}`,
+    `竞价量比 ${fmtRatio(item.ratio_volume)}${t.baselineDate ? ` (基线 ${t.baselineDate})` : ' (无历史基线)'}`,
+    `竞价额比 ${fmtRatio(item.ratio_amount)}`,
+    `占昨日全天额 ${pct(item.prev_amount_share)}`,
+    t.active ? '点击隐藏竞价柱' : '点击显示竞价柱',
+  ].join(' · ')
+}
+
+/** 竞价量: 手, 与分钟量同单位 (不换算成股) */
+function fmtBig(v: number | null | undefined): string {
+  if (v == null || !Number.isFinite(v)) return '—'
+  return v >= 10_000 ? `${(v / 10_000).toFixed(2)}万` : v.toFixed(0)
 }
 
 /** 计算实际涨跌停价 (四舍五入到2位小数) 和实际涨跌停幅度 */
@@ -68,13 +124,14 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
   // 无涨跌幅标的 (注册制新股上市初期窗口, 后端 no_limit 标记): 不存在可信
   // 涨跌停带, 自适应/涨跌停两类模式都退化为纯数据对称范围, 也不画涨跌停虚线
   const limitLinesActive = showLimitLines && !priceLimit?.no_limit
-  // 将数据映射到全天时间轴上的正确位置
-  const timeIndexMap = new Map(FULL_DAY_TIMES.map((t, i) => [t, i]))
-  const closes = new Array(FULL_DAY_TIMES.length).fill(null) as (number | null)[]
-  const highs = new Array(FULL_DAY_TIMES.length).fill(null) as (number | null)[]
-  const lows = new Array(FULL_DAY_TIMES.length).fill(null) as (number | null)[]
-  const avgData = new Array(FULL_DAY_TIMES.length).fill(null) as (number | null)[]
-  const volumes = new Array(FULL_DAY_TIMES.length).fill(null) as (any | null)[]
+  // 将数据映射到全天时间轴上的正确位置 (含 09:25 竞价柱时轴整体加一格)
+  const times = intradayTimes(data)
+  const timeIndexMap = new Map(times.map((t, i) => [t, i]))
+  const closes = new Array(times.length).fill(null) as (number | null)[]
+  const highs = new Array(times.length).fill(null) as (number | null)[]
+  const lows = new Array(times.length).fill(null) as (number | null)[]
+  const avgData = new Array(times.length).fill(null) as (number | null)[]
+  const volumes = new Array(times.length).fill(null) as (any | null)[]
 
   const volNeutral = 'rgba(161,161,170,0.5)'
   // 量柱着色基准: 前一分钟 close; 第一根用昨收。
@@ -204,14 +261,16 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
     }
   }
 
-  // x 轴标签: 9:30, 10:30, 11:30/13:00, 14:00, 15:00
-  // 11:30(idx 120) 和 13:00(idx 121) 相邻会重叠, 合并为一个标签
-  const xAxisLabelMap: Record<number, string> = {
-    0: '9:30',
-    60: '10:30',
-    120: '11:30/13:00',
-    181: '14:00',
-    241: '15:00',
+  // x 轴标签: 9:30, 10:30, 11:30/13:00, 14:00, 15:00 —— 按时刻取位 (竞价柱使轴加一格时
+  // 索引整体后移, 不能写死下标); 11:30 与 13:00 相邻会重叠, 合并为一个标签;
+  // 9:25 竞价柱不加标签 (与 9:30 只差一格, 标签会互相压住), 靠悬停与竞价按钮辨识
+  const xAxisLabelMap: Record<number, string> = {}
+  for (const [time, label] of [
+    [AUCTION_TIME, ''], ['09:30', '9:30'], ['10:30', '10:30'],
+    ['11:30', '11:30/13:00'], ['14:00', '14:00'], ['15:00', '15:00'],
+  ] as [string, string][]) {
+    const idx = times.indexOf(time)
+    if (idx >= 0 && label) xAxisLabelMap[idx] = label
   }
   const xAxisLabelFormatter = (_value: string, idx: number) => {
     return xAxisLabelMap[idx] ?? ''
@@ -252,7 +311,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
     xAxis: [
       {
         type: 'category',
-        data: FULL_DAY_TIMES,
+        data: times,
         boundaryGap: false,
         axisPointer: {
           show: true,
@@ -288,7 +347,7 @@ function buildOption(data: MinuteKlineRow[], prevClose: number | undefined, avgP
       {
         type: 'category',
         gridIndex: 1,
-        data: FULL_DAY_TIMES,
+        data: times,
         boundaryGap: false,
         axisLine: { show: false },
         axisLabel: { show: false },
@@ -417,6 +476,7 @@ export function EChartsIntraday({
   priceLines,
   showLimitLines = true,
   showAvgLine = true,
+  auctionToggle,
 }: Props) {
   const containerRef = useRef<HTMLDivElement>(null)
   const chartRef = useRef<ECharts | null>(null)
@@ -518,7 +578,7 @@ export function EChartsIntraday({
 
     if (data.length > 0) {
       // 构建全日索引 → 数据索引 的映射
-      const timeIndexMap = new Map(FULL_DAY_TIMES.map((t, i) => [t, i]))
+      const timeIndexMap = new Map(intradayTimes(data).map((t, i) => [t, i]))
       const mapping = new Map<number, number>()
       for (let i = 0; i < data.length; i++) {
         const timeKey = formatMinuteTime(data[i].datetime)
@@ -564,9 +624,27 @@ export function EChartsIntraday({
 
   return (
     <div className="w-full">
-      {/* 按钮行: 切换式按钮组, 居右 */}
-      {showLimitLines && <div className="flex items-center justify-end px-1 pb-0.5">
-        <div className="inline-flex items-center rounded bg-elevated overflow-hidden">
+      {/* 按钮行: 左侧集合竞价开关 (09:25 竞价柱 + 竞价成交比), 右侧 Y 轴模式组, 整体居右 */}
+      {(showLimitLines || auctionToggle) && <div className="flex items-center justify-end gap-1.5 px-1 pb-0.5">
+        {auctionToggle && (
+          // title 挂在外层 span: 禁用态按钮在部分浏览器不派发鼠标事件, 悬浮说明会丢
+          <span className="inline-flex" title={auctionTitle(auctionToggle)}>
+            <button
+              onClick={auctionToggle.onToggle}
+              disabled={!auctionToggle.item}
+              className={`rounded px-2.5 py-0.5 font-mono text-[10px] transition-colors ${
+                !auctionToggle.item
+                  ? 'cursor-not-allowed bg-elevated/50 text-muted'
+                  : auctionToggle.active
+                    ? 'cursor-pointer bg-accent/20 text-accent'
+                    : 'cursor-pointer bg-elevated text-muted hover:text-secondary'
+              }`}
+            >
+              竞价 {auctionToggle.item ? fmtRatio(auctionToggle.item.ratio_volume) : '—'}
+            </button>
+          </span>
+        )}
+        {showLimitLines && <div className="inline-flex items-center rounded bg-elevated overflow-hidden">
           <button
             onClick={() => setYMode('adaptive')}
             className={`px-2.5 py-0.5 text-[10px] font-mono cursor-pointer transition-colors ${
@@ -588,7 +666,7 @@ export function EChartsIntraday({
           >
             涨跌停
           </button>
-        </div>
+        </div>}
       </div>}
       <div style={{ backgroundColor: ct.infoBarBg }}>
         {/* 第一行: 日期 + OHLC */}
@@ -597,7 +675,7 @@ export function EChartsIntraday({
           {ohlc && (
             <>
               {date && <span className="text-muted">{date}</span>}
-              <span className="text-muted">{hovered ? `${formatMinuteTime(hovered.datetime)} 分钟` : daily ? '日K（前复权）' : '分时汇总'}</span>
+              <span className="text-muted">{hovered ? barKindLabel(hovered) : daily ? '日K（前复权）' : '分时汇总'}</span>
               <span className="text-muted">开</span>
               <span style={{ color: priceClr }}>{ohlc.open != null ? ohlc.open.toFixed(2) : '—'}</span>
               <span className="text-muted">高</span>

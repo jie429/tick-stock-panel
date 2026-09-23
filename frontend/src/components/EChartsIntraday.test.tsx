@@ -3,6 +3,7 @@ import { act } from 'react'
 import { createRoot } from 'react-dom/client'
 import { afterEach, expect, it, vi } from 'vitest'
 import { EChartsIntraday } from './EChartsIntraday'
+import { FULL_DAY_TIMES } from '@/lib/intraday-chart'
 
 const chart = vi.hoisted(() => ({
   handlers: {} as Record<string, (event?: any) => void>,
@@ -126,4 +127,74 @@ it('listing day without prevClose anchors y-axis with scale, not zero', async ()
   expect(axis.min).toBeUndefined()
   expect(axis.max).toBeUndefined()
   expect(axis.scale).toBe(true)
+})
+
+// ================================================================
+// 集合竞价: 09:25 竞价柱 + 竞价成交比 (量比) 开关
+// ================================================================
+const auctionRows = (day: string) => [
+  { datetime: `${day} 09:25:00`, open: 119.77, high: 119.77, low: 119.77, close: 119.77, volume: 63, amount: 7544000 },
+  { datetime: `${day} 09:31:00`, open: 119.77, high: 119.9, low: 119.5, close: 119.6, volume: 571, amount: 68300000 },
+]
+const auctionItem = {
+  symbol: '600519.SH', open_price: 119.77, open_pct: 0.0056,
+  auction_volume: 63, auction_amount: 7544000,
+  ratio_volume: 3.52, ratio_amount: 3.4, prev_amount_share: 0.0021,
+}
+
+it('集合竞价柱占时轴首格, 交易日刻度后移仍准, 悬停标为集合竞价', async () => {
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+  vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} })
+  chart.on.mockImplementation((name, callback) => { chart.handlers[name] = callback })
+  const host = document.createElement('div')
+  const root = createRoot(host)
+  cleanup = async () => { await act(async () => root.unmount()) }
+  const onToggle = vi.fn()
+
+  await act(async () => root.render(
+    <EChartsIntraday
+      data={auctionRows('2026-09-23')}
+      date="2026-09-23"
+      prevClose={119.1}
+      auctionToggle={{ item: auctionItem, baselineDate: '2026-09-22', active: true, onToggle }}
+    />,
+  ))
+
+  const axis = chart.setOption.mock.calls.at(-1)?.[0]?.xAxis?.[0]
+  expect(axis.data[0]).toBe('09:25')
+  expect(axis.data.length).toBe(FULL_DAY_TIMES.length + 1)
+  expect(axis.axisLabel.formatter('', axis.data.indexOf('09:30'))).toBe('9:30')
+  expect(axis.axisLabel.formatter('', axis.data.indexOf('11:30'))).toBe('11:30/13:00')
+  expect(axis.axisLabel.formatter('', 0)).toBe('')
+
+  const button = host.querySelector('button')
+  expect(button?.textContent).toContain('竞价 3.52×')
+  await act(async () => button?.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+  expect(onToggle).toHaveBeenCalledTimes(1)
+
+  await act(async () => chart.handlers.updateAxisPointer({ axesInfo: [{ axisDim: 'x', value: 0 }] }))
+  expect(host.textContent).toContain('集合竞价')
+  expect(host.textContent).not.toContain('09:25 分钟')
+})
+
+it('该日拿不到竞价: 按钮禁用显示 —, 时轴退回默认全天', async () => {
+  Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true })
+  vi.stubGlobal('ResizeObserver', class { observe() {} disconnect() {} })
+  const host = document.createElement('div')
+  const root = createRoot(host)
+  cleanup = async () => { await act(async () => root.unmount()) }
+
+  await act(async () => root.render(
+    <EChartsIntraday
+      data={[{ datetime: '2026-09-23 09:31:00', open: 119.77, high: 119.9, low: 119.5, close: 119.6, volume: 571, amount: 68300000 }]}
+      date="2026-09-23"
+      auctionToggle={{ item: null, message: '该标的当日无竞价成交', active: true, onToggle: () => {} }}
+    />,
+  ))
+
+  const button = host.querySelector('button') as HTMLButtonElement
+  expect(button.textContent).toContain('竞价 —')
+  expect(button.disabled).toBe(true)
+  expect(button.parentElement?.getAttribute('title')).toContain('无竞价成交')
+  expect(chart.setOption.mock.calls.at(-1)?.[0]?.xAxis?.[0]?.data.length).toBe(FULL_DAY_TIMES.length)
 })

@@ -5,7 +5,7 @@ import { api, type MinuteKlineRow } from '@/lib/api'
 import { QK } from '@/lib/queryKeys'
 import { klineMinuteQueryOptions, minuteRefetchInterval } from '@/lib/kline'
 import { EChartsIntraday } from '@/components/EChartsIntraday'
-import type { DailySummary } from '@/lib/intraday-chart'
+import { buildAuctionBar, prependAuctionBar, type DailySummary } from '@/lib/intraday-chart'
 
 interface Props {
   symbol: string
@@ -37,6 +37,8 @@ export function StockIntradayChart({
 }: Props) {
   const qc = useQueryClient()
   const [minuteDismissed, setMinuteDismissed] = useState(false)
+  /** 集合竞价柱开关 (默认显示; 竞价读数是否可得由后端归档决定) */
+  const [showAuction, setShowAuction] = useState(true)
 
   const minute = useQuery({
     // 轮询上下文 (个股详情) 传 live: 当日盘中后端直接实时拉取最新K,
@@ -55,7 +57,24 @@ export function StockIntradayChart({
     },
   })
 
+  // 集合竞价读数 (09:25 终态快照 + 竞价量比): 与分钟K同一个交易日, 竞价字段当日起不再
+  // 变化 → 不轮询; 只有竞价尚未结束 (not_ready) 时才按 60s 复查一次, 免得开盘前打开的
+  // 弹窗一直停在空态。
+  const auction = useQuery({
+    queryKey: QK.quoteAuction(symbol, date ?? ''),
+    queryFn: () => api.quoteAuction(symbol, date ?? undefined),
+    enabled: !!symbol && !!date,
+    staleTime: 5 * 60_000,
+    refetchInterval: query => (query.state.data?.state === 'not_ready' ? 60_000 : false),
+  })
+  const auctionItem = auction.data?.item ?? null
+
   const minuteRows: MinuteKlineRow[] = useMemo(() => minute.data?.rows ?? [], [minute.data?.rows])
+  // 竞价柱插在分时最前, 并从首根分钟柱扣掉竞价那一份 (源分钟K把 09:25 竞价并入了首根柱)
+  const displayRows: MinuteKlineRow[] = useMemo(() => {
+    const bar = showAuction ? buildAuctionBar(date ?? '', auctionItem) : null
+    return bar ? prependAuctionBar(minuteRows, bar) : minuteRows
+  }, [minuteRows, showAuction, date, auctionItem])
   // source=none 表示本地无数据且 TickFlow 也拉不到 (停牌/复牌延迟/非交易日)
   // 此时不弹"是否获取"询问窗, 只做静态提示, 避免误导用户去拉明知拉不到的数据
   const sourceIsNone = minute.data?.source === 'none'
@@ -126,7 +145,7 @@ export function StockIntradayChart({
       )}
       {minuteRows.length > 0 && (
         <EChartsIntraday
-          data={minuteRows}
+          data={displayRows}
           height={height}
           prevClose={minute.data?.prev_close ?? prevClose}
           dailySummary={dailySummary}
@@ -136,6 +155,14 @@ export function StockIntradayChart({
           onPriceDoubleClick={onPriceDoubleClick}
           currentPrice={currentPrice}
           priceLines={priceLines}
+          auctionToggle={{
+            item: auctionItem,
+            baselineDate: auction.data?.baseline_date ?? null,
+            message: auction.data?.message ?? null,
+            pending: auction.isLoading,
+            active: showAuction,
+            onToggle: () => setShowAuction(v => !v),
+          }}
         />
       )}
     </div>

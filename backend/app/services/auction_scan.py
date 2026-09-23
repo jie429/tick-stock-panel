@@ -16,6 +16,8 @@
 - 竞价终态 (09:25) 后当天只写一次 (竞价字段当日起不可变), 显式 refresh 才重写;
   盘中会变的 amount/内外盘/封单额仅作落盘时点快照, 不参与任何比较
 - 历史日文件不可变: 命中直接读盘, 不触发 Provider、不加载插件注册表
+- 单只标的读取 (``get_symbol_auction``, 个股分时图 09:25 竞价柱用): 复用同一份按日
+  落盘快照与基线, 当日按需扫描, 历史日只读盘; 归档内查不到该标的 → item=None
 - 竞价量比基线 = 目标日之前最近一份快照; 无基线时 ratio 为 None (前端列显 "—"),
   历史自启用之日起积累 —— 竞价明细本身没有历史接口, 这是既有结论的落地方案
 - 进程内 60 秒 TTL 缓存: 前端 60s 轮询不会把 TCP 源打穿
@@ -285,6 +287,30 @@ def _round(value: Any, digits: int) -> Any:
         return None
 
 
+def _auction_item(
+    row: dict, baseline_row: dict, prev_amounts: dict[str, float],
+) -> dict[str, Any]:
+    """快照行 + 基线行 → 对外条目 (含竞价量比/额比/昨日额占比)。
+
+    竞价量比 (成交比) 无基线 (首日) 时为 None, 前端显 "—"; 不拿 0 或缺档冒充。
+    """
+    symbol = row.get("symbol")
+    # name 始终在键内 (无维表时为 None), 保持前端类型稳定
+    item: dict[str, Any] = {"name": None, **{key: row.get(key) for key in _ITEM_FIELDS}}
+    item["open_pct"] = _round(row.get("open_pct"), 6)
+    item["change_pct"] = _round(row.get("change_pct"), 6)
+    item["ratio_volume"] = _round(
+        _ratio(row.get("auction_volume"), baseline_row.get("auction_volume")), 4,
+    )
+    item["ratio_amount"] = _round(
+        _ratio(row.get("auction_amount"), baseline_row.get("auction_amount")), 4,
+    )
+    item["prev_amount_share"] = _round(
+        _ratio(row.get("auction_amount"), prev_amounts.get(symbol)), 6,
+    )
+    return item
+
+
 def _compose_items(
     rows: list[dict],
     *,
@@ -305,24 +331,9 @@ def _compose_items(
         open_pct = row.get("open_pct")
         if not symbol or open_pct is None:
             continue
-        open_pct = float(open_pct)
-        if open_pct * 100.0 < min_open_pct:
+        if float(open_pct) * 100.0 < min_open_pct:
             continue
-        base = baseline.get(symbol) or {}
-        # name 始终在键内 (无维表时为 None), 保持前端类型稳定
-        item: dict[str, Any] = {"name": None, **{key: row.get(key) for key in _ITEM_FIELDS}}
-        item["open_pct"] = _round(open_pct, 6)
-        item["change_pct"] = _round(row.get("change_pct"), 6)
-        item["ratio_volume"] = _round(
-            _ratio(row.get("auction_volume"), base.get("auction_volume")), 4,
-        )
-        item["ratio_amount"] = _round(
-            _ratio(row.get("auction_amount"), base.get("auction_amount")), 4,
-        )
-        item["prev_amount_share"] = _round(
-            _ratio(row.get("auction_amount"), prev_amounts.get(symbol)), 6,
-        )
-        prepared.append(item)
+        prepared.append(_auction_item(row, baseline.get(symbol) or {}, prev_amounts))
 
     high_open = len(prepared)
     if baseline:
@@ -458,3 +469,127 @@ def get_auction_scan(
         "counts": {"scanned": len(rows), "high_open": high_open, "hits": hits},
         "items": _attach_names(items, repo),
     }
+
+
+def _symbol_payload(
+    state: str,
+    message: str | None,
+    symbol: str,
+    *,
+    trade_date: str | None = None,
+    baseline_date: str | None = None,
+    ratio_ready: bool = False,
+    item: dict | None = None,
+) -> dict[str, Any]:
+    """单只标的读数的空/降级响应 (状态与字段名与全市场扫描一致, 前端复用同一套)。"""
+    return {
+        "state": state,
+        "message": message,
+        "symbol": symbol,
+        "trade_date": trade_date,
+        "baseline_date": baseline_date,
+        "ratio_ready": ratio_ready,
+        "item": item,
+    }
+
+
+def get_symbol_auction(
+    data_dir: Path,
+    symbol: str,
+    *,
+    date: str | None = None,
+    repo: Any | None = None,
+    now: Any | None = None,
+    provider: Any | None = None,
+    refresh: bool = False,
+) -> dict[str, Any]:
+    """单只标的的竞价快照 + 竞价量比/额比/昨日额占比 (个股分时图 09:25 竞价柱)。
+
+    只复用既有落盘快照与进程内缓存, 不新开采集通道:
+    - ``date`` 省略 = 当日: 09:25 终态后按实时行情源扫描 (与 /auction-scan 同一份
+      60 秒 TTL 缓存与当日落盘文件); 竞价未结束/源不可用时当日归档仍可读
+    - ``date`` 给定 = 历史日: 只读归档 (历史日快照不可变, 不触发 Provider)
+    - 状态同全市场扫描: ok | not_ready | source_unavailable | no_data;
+      归档里查不到该标的 (停牌/未参与竞价) 时 state=ok 且 item=None, 不伪造成 0
+
+    now / provider 仅为测试与显式注入保留。
+    """
+    from app.services import trading_day
+
+    now = now or cn_now()
+    today = now.date()
+    requested = (date or "").strip()
+    if requested:
+        try:
+            target = date_cls.fromisoformat(requested)
+        except ValueError:
+            return _symbol_payload(
+                "no_data", f"日期非法: {requested!r} (需 YYYY-MM-DD)", symbol,
+            )
+    else:
+        target = today
+    if target > today:
+        return _symbol_payload(
+            "no_data", f"{target.isoformat()} 尚未到来, 无竞价快照", symbol,
+            trade_date=target.isoformat(),
+        )
+
+    if target < today:
+        _, rows = _load_snapshot(data_dir, target)
+        if not rows:
+            return _symbol_payload(
+                "no_data",
+                f"{target.isoformat()} 无竞价快照 (快照自启用之日起按日归档)",
+                symbol,
+                trade_date=target.isoformat(),
+            )
+    else:
+        stored = _load_snapshot(data_dir, target)[1]
+        session = trading_day.is_trading_day(now)
+        if session is False or now.time() < AUCTION_READY_TIME:
+            # 竞价终态未产生: 当日已有归档 (此前扫描过) 时仍按归档回答
+            if not stored:
+                if session is False:
+                    return _symbol_payload("no_data", "今日休市, 无竞价快照", symbol)
+                return _symbol_payload(
+                    "not_ready",
+                    f"集合竞价需在 {AUCTION_READY_TIME.strftime('%H:%M')} 后采集",
+                    symbol,
+                )
+            rows = stored
+        else:
+            source = provider if provider is not None else _resolve_provider()
+            if source is None:
+                if not stored:
+                    return _symbol_payload(
+                        "source_unavailable",
+                        "实时行情源未实现全市场竞价扫描 "
+                        "(需可选协议 get_market_auction_snapshot)",
+                        symbol,
+                    )
+                rows = stored
+            else:
+                fetched = _scan_today(data_dir, source, target, refresh=refresh)
+                if fetched is None and not stored:
+                    return _symbol_payload(
+                        "no_data", "全市场竞价快照拉取失败或当日无竞价成交", symbol,
+                    )
+                rows = fetched or stored
+
+    baseline_date, baseline_rows = _latest_snapshot(data_dir, before=target)
+    baseline = {row["symbol"]: row for row in baseline_rows if row.get("symbol")}
+    row = next((entry for entry in rows if entry.get("symbol") == symbol), None)
+    item = (
+        _auction_item(row, baseline.get(symbol) or {}, _prev_day_amounts(data_dir, target))
+        if row is not None
+        else None
+    )
+    return _symbol_payload(
+        "ok",
+        None if item is not None else "该标的当日无竞价成交 (停牌/未参与竞价)",
+        symbol,
+        trade_date=target.isoformat(),
+        baseline_date=baseline_date.isoformat() if baseline_date else None,
+        ratio_ready=bool(baseline),
+        item=_attach_names([item], repo)[0] if item is not None else None,
+    )
