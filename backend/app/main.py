@@ -29,6 +29,7 @@ from app.api import (
     mining,
     monitor_rules,
     overview,
+    paper,
     pipeline,
     regime,
     rps,
@@ -485,6 +486,7 @@ app.include_router(intraday.router)
 app.include_router(quote_api.router)
 app.include_router(indices.router)
 app.include_router(overview.router)
+app.include_router(paper.router)
 app.include_router(abnormal.router)
 app.include_router(regime.router)
 app.include_router(analysis.router)
