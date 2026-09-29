@@ -1,6 +1,6 @@
 # 数据源插件开发指南
 
-数据源插件是可选的行情数据来源(fuyao、麦蕊智数、stock-sdk、akshare 等),作为独立模块放在
+数据源插件是可选的行情数据来源(fuyao、麦蕊智数、eltdx、akshare 等),作为独立模块放在
 `backend/app/plugins/` 下。services 层(kline_sync / quote_service / financial_sync)
 全部通过统一路由点分流:插件声明了某数据集就走插件,未声明自动回退 TickFlow。
 因此**日K、分钟K、实时、除权和财务等已接通的数据集**只需正确实现契约，无需改动
@@ -59,12 +59,9 @@ TickFlow 的「先探后存」语义:
 | runtime | 含义 | 典型场景 |
 |---|---|---|
 | `python` | 纯 Python 依赖, `pip install` | akshare、tushare |
-| `node` | 需要 Node.js 运行时, `npm install` | stock-sdk |
+| `node` | 需要 Node.js 运行时, `npm install` | 自建 Node 桥接插件 |
 | `none` | 无额外依赖 | 纯 HTTP API 源 |
 
-> ⚠️ stock-sdk 在 Docker 中默认不打包(合规考虑:它抓取第三方财经网站接口,存在版权与
-> 反爬风险)。如需启用,构建时传 `--build-arg INCLUDE_STOCKSDK=1`,使用风险自负。
-> 详见 [deployment.md](./deployment.md)。
 
 `runtime` 字段当前仅用于 UI 展示, 实际依赖检测由 `check` 函数负责。
 
@@ -246,7 +243,7 @@ class MyProvider:
 记日志；完全无法识别的口径 → 拒收并回退 TickFlow。契约仍要求源头写对，守卫只是兜底。
 
 可选类属性 `minute_history_days = 5` 声明 1 分钟历史深度（交易日）；未声明视为
-深历史（TickFlow 基准）。浅源（如 stock-sdk 免费分时仅保留最近 5 个交易日）声明后，
+深历史（TickFlow 基准）。浅源（如某免费分时接口仅保留最近 5 个交易日）声明后，
 个股分时档位自动收窄为可行选项并默认 5 日，深源默认 20 日。
 
 > **全量分钟 (full_minute) 数据集契约**:声明 `full_minute` 数据集并把
@@ -436,10 +433,6 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - `adj_factor` 推导: 取 `corporate.capital_changes` 的除权除息事件(每 10 股口径 c1=现金分红 c2=配股价 c3=送转股 c4=配股)与事件日前的原始日K收盘价, 按 `参考价 = (前收盘×10 − 现金分红 + 配股×配股价) / (10 + 送转股 + 配股)` 得**单事件**比值; 不使用上游逐日前/后复权仿射系数, 那与"单事件因子 + 管道自行累积"的契约不同构
   - 不声明 `financial`(上游只有简版财务批量字段)与 `full_minute`(按标的拉取撑不住盘中全市场分钟落盘); `fallback_to_tickflow_on_error: false` 来源隔离, 故障时返回明确空结果
   - `tests/test_eltdx_provider.py` — 121 个契约测试(单位换算与指数成交量口径、分页方向与页数上限、80 只切批、五档价与缺档、成交方向的内外盘映射与 80 只切批/软失败、全市场竞价扫描的归一与翻页/页数上限/去重/软失败、概念板块分组的折叠与软失败三态、除权因子公式、能力声明、availability 两态、loader 注册); `tests/test_eltdx_desktop_packaging.py` — 桌面打包静态契约; `tests/test_auction_scan.py` — 竞价扫描服务契约(状态机、落盘与 TTL 缓存、竞价量比与阈值、名称补全, 全离线)
-- **`backend/app/plugins/stocksdk/`** — Node 型插件, 通过 subprocess 桥接调用 stock-sdk
-  - `bridge.py` — Python↔Node 桥接 + availability 检测
-  - `bridge.mjs` — Node 端(并发池、重试、SDK 解析)
-  - `provider.py` — Provider 实现(归一化、分批、错误降级)
 
 ## 路由机制(无需关心, 仅参考)
 
