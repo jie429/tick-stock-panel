@@ -3,7 +3,7 @@
 不依赖真实网络: 用假 eltdx client 返回样例 K 线页/报价快照/除权事件, 验证字段映射、
 单位口径 (CONTRIBUTING §3.1: ``volume_lots``/``total_hand`` 原样为手、百分数→小数、
 指数成交量放大 100 倍)、K 线分页方向与页数上限、报价与五档按 80 只切批、软失败与
-``failed_out``、除权因子推导、能力声明、availability 两态与 loader 注册。
+``failed_out``、全量分钟当日窗口与取数根数收敛、除权因子推导、能力声明、availability 两态与 loader 注册。
 """
 
 from __future__ import annotations
@@ -649,6 +649,127 @@ def test_minute_empty_symbols_returns_empty_frame(monkeypatch):
     provider = _install(monkeypatch, _FakeClient())
     frame = provider.get_minute([], None, None)
     assert frame.height == 0 and frame.columns == list(ep._MINUTE_SCHEMA)
+
+
+def test_minute_universe_chunk_size_bounds_rows_per_batch():
+    """单批标的数按窗口长度收缩, 且单批行数不超过预算。"""
+    t0 = datetime(2026, 8, 3, 9, 30)
+    week = ep._minute_universe_chunk_size(t0, t0 + timedelta(days=7))
+    year = ep._minute_universe_chunk_size(t0, t0 + timedelta(days=365))
+    # 窗口越长每只行数越多 → 批越小, 且始终夹在 [1, 标的数上限]
+    assert 0 < year < week <= ep._MINUTE_UNIVERSE_MAX_SYMBOLS
+    assert week * (7 * 5 // 7 + 1) * ep._MINUTE_BARS_PER_TRADING_DAY <= ep._MINUTE_UNIVERSE_CHUNK_ROWS
+    assert year * (365 * 5 // 7 + 1) * ep._MINUTE_BARS_PER_TRADING_DAY <= ep._MINUTE_UNIVERSE_CHUNK_ROWS
+    # count 模式 (无窗口) 按最小窗口处理, 不返回 0
+    assert ep._minute_universe_chunk_size(None, None) == ep._MINUTE_UNIVERSE_MAX_SYMBOLS
+
+
+def test_iter_minute_streams_bounded_batches_with_progress(monkeypatch):
+    """iter_minute 按批 yield (峰值内存 = 单批), 进度回调覆盖每只标的且递增。"""
+    monkeypatch.setattr(ep, "_MINUTE_UNIVERSE_MAX_SYMBOLS", 2)
+    fake = _FakeClient(bars={
+        "sh600519": [[_minute(9, 31, close=1500.0)]],
+        "sz000001": [[_minute(9, 31, close=11.0)]],
+        "sh600000": [[_minute(9, 31, close=9.0)]],
+    })
+    provider = _install(monkeypatch, fake)
+    seen: list[tuple[int, int]] = []
+    frames = list(provider.iter_minute(
+        ["600519.SH", "000001.SZ", "600000.SH"], None, None,
+        on_chunk_done=lambda done, total: seen.append((done, total)),
+    ))
+    # 3 只 / 批上限 2 → 两帧, 不把整池攒成一帧
+    # 每帧内部按 symbol 排序 (与 get_minute 单帧口径一致)
+    assert [frame["symbol"].to_list() for frame in frames] == [
+        ["000001.SZ", "600519.SH"], ["600000.SH"],
+    ]
+    assert seen == [(1, 3), (2, 3), (3, 3)]
+
+
+def test_iter_minute_partial_failure_keeps_successful_batches(monkeypatch):
+    """单只失败不连坐: 写 failed_out, 成功批照常 yield。"""
+    monkeypatch.setattr(ep, "_MINUTE_UNIVERSE_MAX_SYMBOLS", 2)
+    fake = _FakeClient(bars={"sh600519": [[_minute(9, 31, close=1500.0)]]})
+
+    def _partial(code, period="1m", start=0, count=800):
+        if code == "sz000001":
+            raise RuntimeError("上游断流")
+        return _Page([_minute(9, 31, close=11.0)])
+
+    fake.bars.get = _partial
+    provider = _install(monkeypatch, fake)
+    failed: list[str] = []
+    frames = list(provider.iter_minute(
+        ["600519.SH", "000001.SZ", "600000.SH"], None, None, failed_out=failed,
+    ))
+    assert [frame["symbol"].to_list() for frame in frames] == [["600519.SH"], ["600000.SH"]]
+    assert failed == ["000001.SZ"]
+
+
+# =====================================================================
+# full_minute: 当日窗口批量拉取 (修复轮)
+# =====================================================================
+
+
+def test_intraday_window_clamps_to_session_bounds():
+    """窗口固定 09:25 起、收盘截断; 盘前得到空窗口 (不越界到上一交易日)。"""
+    start, end = ep._intraday_window(datetime(2026, 8, 3, 10, 30, tzinfo=_CN))
+    assert (start, end) == (datetime(2026, 8, 3, 9, 25), datetime(2026, 8, 3, 10, 30))
+    start, end = ep._intraday_window(datetime(2026, 8, 3, 20, 0, tzinfo=_CN))
+    assert (start, end) == (datetime(2026, 8, 3, 9, 25), datetime(2026, 8, 3, 15, 0))
+    start, end = ep._intraday_window(datetime(2026, 8, 3, 9, 10, tzinfo=_CN))
+    assert end <= start
+
+
+def test_get_intraday_batch_fetches_only_window_bars(monkeypatch):
+    """只取窗口内需要的根数: 单页请求 (start=0) 且 count 随窗口收敛, 窗口外不入帧。"""
+    monkeypatch.setattr(
+        ep, "_intraday_window",
+        lambda now: (datetime(2026, 8, 3, 9, 25), datetime(2026, 8, 3, 10, 0)),
+    )
+    fake = _FakeClient(bars={
+        "sh600519": [[_minute(9, 20), _minute(9, 31, close=1500.0), _minute(10, 5)]],
+    })
+    provider = _install(monkeypatch, fake)
+    frame = provider.get_intraday_batch(["600519.SH"])
+    # 35 分钟窗口 + 2 根余量 = 37, 不拉满 800 根整页 (全市场传输量按窗口收敛)
+    assert fake.bars.calls == [
+        {"code": "sh600519", "period": "1m", "start": 0, "count": 37},
+    ]
+    assert frame["datetime"].to_list() == [datetime(2026, 8, 3, 9, 31)]
+    assert frame.columns == list(ep._MINUTE_SCHEMA)
+
+
+def test_get_intraday_batch_honours_smaller_count(monkeypatch):
+    """count 比窗口根数更小时按 count 收口 (契约参数优先)。"""
+    monkeypatch.setattr(
+        ep, "_intraday_window",
+        lambda now: (datetime(2026, 8, 3, 9, 25), datetime(2026, 8, 3, 10, 0)),
+    )
+    fake = _FakeClient(bars={"sh600519": [[_minute(9, 31)]]})
+    provider = _install(monkeypatch, fake)
+    provider.get_intraday_batch(["600519.SH"], count=3)
+    assert fake.bars.calls[0]["count"] == 3
+
+
+def test_get_intraday_batch_empty_window_skips_upstream(monkeypatch):
+    """盘前空窗口: 不请求上游, 直接返回同形空帧。"""
+    monkeypatch.setattr(
+        ep, "_intraday_window",
+        lambda now: (datetime(2026, 8, 3, 9, 25), datetime(2026, 8, 3, 9, 10)),
+    )
+    fake = _FakeClient(bars={"sh600519": [[_minute(9, 31)]]})
+    provider = _install(monkeypatch, fake)
+    frame = provider.get_intraday_batch(["600519.SH"])
+    assert fake.bars.calls == []
+    assert frame.height == 0 and frame.columns == list(ep._MINUTE_SCHEMA)
+
+
+def test_no_cheap_increment_endpoint_keeps_repair_only():
+    """无单请求全市场端点: 不实现 get_intraday_latest, 服务据此按仅修复轮调度 (60s 下限)。"""
+    provider = EltdxProvider()
+    assert callable(getattr(provider, "get_intraday_batch", None))
+    assert not callable(getattr(provider, "get_intraday_latest", None))
 
 
 # =====================================================================
@@ -1312,11 +1433,12 @@ def test_instruments_error_and_empty_are_hard_failures(monkeypatch):
 
 
 def test_datasets_declaration():
-    """声明 daily/adj_factor/minute/realtime/depth5; financial 未声明。"""
+    """声明 daily/adj_factor/minute/full_minute/realtime/depth5; financial 未声明。"""
     datasets = EltdxProvider().config.datasets
-    assert set(datasets) == {"daily", "adj_factor", "minute", "realtime", "depth5"}
+    assert set(datasets) == {
+        "daily", "adj_factor", "minute", "full_minute", "realtime", "depth5",
+    }
     assert "financial" not in datasets
-    assert "full_minute" not in datasets
 
 
 def test_provider_capability_flags():
@@ -1325,8 +1447,8 @@ def test_provider_capability_flags():
     assert provider.builtin is True
     assert provider.daily_asset_types == frozenset({"stock", "etf", "index"})
     assert provider.instrument_asset_types == frozenset({"stock", "etf", "index"})
-    # 按标的拉分钟, 不能承接全市场分钟落盘
-    assert provider.supports_minute_universe_sync is False
+    # 按标的拉分钟; 全市场落盘由 iter_minute 分批 yield + 逐批落盘承接
+    assert provider.supports_minute_universe_sync is True
     assert provider.minute_history_days == 90
     assert provider.supports_daily_failure_reporting is True
     assert provider.supports_minute_failure_reporting is True
@@ -1336,14 +1458,15 @@ def test_provider_capability_flags():
     assert provider.realtime_min_interval == 30.0
 
 
-def test_provider_has_dataset_false_for_undeclared(monkeypatch):
+def test_provider_has_dataset_follows_declaration(monkeypatch):
     from app.data_providers.custom import loader
 
     monkeypatch.setattr(loader, "_PROVIDERS", {"eltdx": EltdxProvider()})
     assert loader.provider_has_dataset("eltdx", "daily")
     assert loader.provider_has_dataset("eltdx", "depth5")
+    # 全量分钟已声明: 路由到 eltdx 即提供该能力 (与 minute 是两条独立能力键)
+    assert loader.provider_has_dataset("eltdx", "full_minute")
     assert not loader.provider_has_dataset("eltdx", "financial")
-    assert not loader.provider_has_dataset("eltdx", "full_minute")
 
 
 def test_plugin_manifest_declares_contract():
@@ -1355,7 +1478,7 @@ def test_plugin_manifest_declares_contract():
     assert manifest["entry"] == "app.plugins.eltdx.provider:EltdxProvider"
     assert manifest["check"] == "app.plugins.eltdx.bridge:availability"
     assert manifest["runtime"] == "python"
-    assert {"daily", "adj_factor", "minute", "realtime", "depth5"} <= set(manifest["datasets"])
+    assert {"daily", "adj_factor", "minute", "full_minute", "realtime", "depth5"} <= set(manifest["datasets"])
     assert manifest["fallback_to_tickflow_on_error"] is False
     assert manifest["homepage"] == "https://github.com/electkismet/eltdx"
     assert manifest.get("hidden") is not True
@@ -1531,7 +1654,9 @@ def test_create_client_uses_builtin_host_list(monkeypatch):
     monkeypatch.setattr(eb, "_client_class", lambda: _Client)
     client = eb.create_client()
     assert isinstance(client, _Client)
-    assert captured == {"timeout": 8.0, "pool_size": 2, "probe_hosts": False}
+    # pool_size 取 eltdx 默认连接池布局 (2 台服务器 x 4 条连接): 分钟K按标的请求,
+    # 全市场批内并发度直接由它收口。
+    assert captured == {"timeout": 8.0, "pool_size": 8, "probe_hosts": False}
 
 
 def test_create_client_without_dependency_raises_readable_error(monkeypatch):
@@ -1590,6 +1715,21 @@ def test_test_dataset_minute_uses_first_symbol_only(monkeypatch):
     provider = _install(monkeypatch, fake)
     out = provider.test_dataset("minute", ["600000.SH", "600519.SH"])
     assert out["rows"] == 1
+    assert [call["code"] for call in fake.bars.calls] == ["sh600000"]
+
+
+def test_test_dataset_full_minute_preview(monkeypatch):
+    """试拉全量分钟: 只打首只标的的当日窗口, 不触发全市场批量。"""
+    monkeypatch.setattr(
+        ep, "_intraday_window",
+        lambda now: (datetime(2026, 8, 3, 9, 25), datetime(2026, 8, 3, 10, 0)),
+    )
+    fake = _FakeClient(bars={"sh600000": [[_minute(9, 31, close=9.0)]]})
+    provider = _install(monkeypatch, fake)
+    out = provider.test_dataset("full_minute", ["600000.SH", "600519.SH"])
+    assert out["provider"] == "eltdx" and out["dataset"] == "full_minute"
+    assert out["rows"] == 1
+    assert out["preview"][0]["symbol"] == "600000.SH"
     assert [call["code"] for call in fake.bars.calls] == ["sh600000"]
 
 

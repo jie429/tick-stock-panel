@@ -132,7 +132,8 @@ class MyProvider:
     # 可选: 未声明时只覆盖 stock 日K/维表; 自定义源可显式扩展至 index/etf。
     daily_asset_types = frozenset({"stock"})
     instrument_asset_types = frozenset({"stock"})
-    # 仅在 Provider 真正支持全市场分钟落盘时才能设为 True。
+    # 仅在 Provider 真正支持全市场分钟落盘时才能设为 True (按标的请求的源还须实现
+    # iter_minute 分批 yield, 否则框架会把整池标的交给 get_minute 一次性拉完)。
     supports_minute_universe_sync = False
     # 可选: 分钟K历史窗口(交易日); 未声明表示不主动收窄。
     minute_history_days = 5
@@ -160,6 +161,11 @@ class MyProvider:
     def get_minute(self, symbols, start_time, end_time, asset_type="stock",
                    on_chunk_done=None, freq="1m") -> pl.DataFrame:
         """分钟K: [symbol, datetime(北京墙钟), open, high, low, close, volume, amount(元, 可空)]"""
+
+    def iter_minute(self, symbols, start_time, end_time, asset_type="stock",
+                    freq="1m", on_chunk_done=None, failed_out=None):
+        """(可选)有界分批 yield 与 get_minute 同形的分钟K; 按标的请求的全市场落盘源
+        应实现 (峰值内存 = 单批), 见下文「全市场分钟落盘」。"""
 
     def get_intraday_batch(self, symbols, count=300, asset_type="stock") -> pl.DataFrame:
         """(声明 full_minute 数据集时实现) 全量分钟修复轮: 给定标的当日 1 分钟K,
@@ -244,7 +250,23 @@ class MyProvider:
 
 可选类属性 `minute_history_days = 5` 声明 1 分钟历史深度（交易日）；未声明视为
 深历史（TickFlow 基准）。浅源（如某免费分时接口仅保留最近 5 个交易日）声明后，
-个股分时档位自动收窄为可行选项并默认 5 日，深源默认 20 日。
+个股分时档位自动收窄为可行选项并默认 5 日，深源默认 20 日。全市场手动获取的长跨度
+档位同样按它收口（声明 90 就是「获取最近 90 交易日」），避免发起本源取不到的窗口。
+
+### 全市场分钟落盘
+
+按标的（或分组）请求的源要承接全市场分钟落盘，必须实现 `iter_minute`：
+
+- 每批 yield 一帧与 `get_minute` 同形的数据，**批次大小要有明确上界**（按窗口长度反推：
+  1m 每只每交易日 240 根 × 标的数 不超过 provider 内部的行数预算），不得先把全部结果
+  放进列表再 `concat`；
+- `on_chunk_done(cur, total)` 覆盖每一只标的（`total` = 本次请求的标的数），供进度展示；
+- `failed_out` 追加本轮失败标的，全部标的失败时抛异常（与 `get_minute` 同语义）。
+
+实现后 `kline_sync.sync_and_persist_minute` 逐批消费并逐批写盘（`_write_minute_partition`），
+峰值内存 = 单批；未实现的源仍走一次性 `get_minute`，全市场历史会先在 provider 内攒出
+整池标的的行（5000+ 只 × 数月 ≈ 上亿行）再落盘。因此按标的请求的源不应只声明
+`supports_minute_universe_sync = True` 而不实现分批。
 
 > **全量分钟 (full_minute) 数据集契约**:声明 `full_minute` 数据集并把
 > `full_minute_data_provider` 路由到你的源,即接入「全量分钟」能力(盘中全市场
@@ -264,16 +286,18 @@ class MyProvider:
 > `get_minute` 同纪律);失败抛异常或返回空 df 均按空轮处理,连续空轮触发
 > 修复轮自愈。声明方式:插件在 `plugin.yaml` 的 `datasets:` 列表加入
 > `full_minute`。YAML 声明式源同样支持(数据集配置与 `minute` 同形,仅提供
-> 修复轮语义,见 [custom-data-source.md](./custom-data-source.md))。
+> 修复轮语义,见 [custom-data-source.md](./custom-data-source.md))。参考实现: 内置 `eltdx` — 无单请求全市场端点, 只实现 `get_intraday_batch`, 由服务按仅修复轮调度。
 
 可选类属性 `daily_asset_types` 与 `instrument_asset_types` 分别声明日K和基础标的维表
 覆盖的资产类型。未声明时为兼容旧 Provider, 均按仅 `stock` 处理。`get_instruments()`
 仅应返回上游可可靠给出的字段; 如只有代码表, 不得伪造股本、涨跌停等金融元数据。
 
 `supports_minute_universe_sync` 默认应为 `False`。能按标的或分组拉取分钟K, 不等于能
-承受全市场分钟落盘；未明确声明时，全市场入口会拒绝该 Provider。若分钟源必须保持
-来源隔离，可设置 `fallback_to_tickflow_on_error = False`；请求失败或分钟时间契约校验
-失败时会返回空结果而不会隐式调用 TickFlow。
+承受全市场分钟落盘；未明确声明时，全市场入口会拒绝该 Provider，数据页「分钟 K · 同步
+设置」的自动同步开关与手动获取一并禁用。声明 `True` 即承诺「本源可被全市场落盘入口
+驱动」，框架据此放行；按标的请求的源必须同时实现 `iter_minute`（见上）才能把峰值内存
+压到单批。若分钟源必须保持来源隔离，可设置 `fallback_to_tickflow_on_error = False`；
+请求失败或分钟时间契约校验失败时会返回空结果而不会隐式调用 TickFlow。
 
 ### 异常语义
 
@@ -288,11 +312,12 @@ class MyProvider:
 | `get_minute` | 默认抛异常时调用方回退 TickFlow；设 `fallback_to_tickflow_on_error = False` 时 fail-closed |
 | `get_daily` / `get_adj_factors` / `get_financials` | 异常由上层同步流程捕获记录; 无数据返回空 DataFrame |
 | `iter_daily` | 可选; 每批必须符合 `get_daily` 契约。流正常结束后才提交 staging; 未捕获异常会丢弃 staging。provider 内已定义的单标的软失败语义保持不变 |
+| `iter_minute` | 可选; 每批必须符合 `get_minute` 契约。落库同步逐批消费、逐批写盘; 异常按来源隔离规则显式失败 (不回退 TickFlow), 已落盘分区保留 |
 
 `iter_daily` 用于避免大范围日K同步在 provider 内累积完整 DataFrame。实现该方法后,
 `kline_sync` 会优先消费它; 未实现的 provider 继续调用 `get_daily`,保持兼容。批次大小应有
 明确上界,不得先把全部结果放入列表再 `concat`。`on_chunk_done(cur, total)` 必须覆盖空批次,
-确保最终 `cur == total`。
+确保最终 `cur == total`。分钟K上的同形契约是 `iter_minute`, 见上文「全市场分钟落盘」。
 
 ### get_realtime 行字段
 
@@ -419,8 +444,9 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - licence 在设置页先探后存,或通过 `MAIRUI_LICENSE` 配置;真实 licence 永不写入代码、清单或测试
 - **`backend/app/plugins/eltdx/`** — eltdx 免费通达信行情协议数据源(runtime: python, 直接复用 [eltdx](https://github.com/electkismet/eltdx) 的 TCP 客户端, 不启动它的 MCP/HTTP 服务, 无 API Key)
   - 依赖 `eltdx>=3.2,<4`: 桌面发行版由 `desktop` extra 内置(`packaging/tickflow.spec` 里 `collect_all("eltdx")`), 源码/容器安装由插件目录的 `requirements.txt` 经设置页安装。3.0 起上游 API 按命名空间重写, 0.5.x 的扁平接口已全部移除, 不能沿用旧代码
-  - `bridge.py` — 轻量边界: `availability()` 只做导入 + 版本区间 + 实例方法存在性检查(**不探测 TCP 主机**, 插件扫描不能因测速阻塞启动); `create_client()` 不接受任何外部 host, 只用 eltdx 自带默认行情服务器列表, 避免可选源变成任意 TCP 出口
+  - `bridge.py` — 轻量边界: `availability()` 只做导入 + 版本区间 + 实例方法存在性检查(**不探测 TCP 主机**, 插件扫描不能因测速阻塞启动); `create_client()` 不接受任何外部 host, 只用 eltdx 自带默认行情服务器列表, 避免可选源变成任意 TCP 出口; 连接池取 eltdx 默认布局 (`pool_size=8` = 2 台服务器 × 4 条连接), 分钟K按标的请求的批内并发度由它收口
   - 提供 `daily`(股票/ETF/指数不复权原始日K)、`adj_factor`、`minute`(按标的 1 分钟 OHLCV, 实测历史约 100 个交易日)、`realtime`(A 股 + ETF 全市场快照)、`depth5`(五档价 + 量), 并有可选协议 `get_trade_flow`(内盘/外盘)
+  - 全市场分钟落盘: 声明 `supports_minute_universe_sync = True` 并实现 `iter_minute`。通达信没有全市场分钟端点, 批次大小按窗口长度反推 (1m 每只每交易日 240 根, 行数预算 40 万 → 窗口 5 日时 277 只/批, 1 年时 6 只/批, 标的数上限 500), 批内按标的并发 (8 线程, 真实并发由连接池收口) 且 `pool.map` 保序, 消费方逐批写盘, 峰值内存 = 单批。数据页「分钟 K · 同步设置」的自动同步与手动获取因此可用 (自动同步走盘后管道 Step 2.5)。全量分钟 (`get_intraday_batch`) 复用同一批机制: 当日窗口 [09:25, min(now, 15:00)] 按窗口分钟数收敛单只根数 (不拉满 800 根整页), 实测 5578 只 ≈ 26 秒/轮; 因无廉价增量端点不实现 `get_intraday_latest`, 由服务按仅修复轮调度 (节奏下限 60s)
   - 单位口径: 价格与成交额为元, `volume_lots`/`total_hand` 原生为**手**, 原样透传不再换算; `change_pct`/`amplitude` 统一由 `change_amount/prev_close` 推导成小数制, 不混用上游的百分数属性
   - 指数成交量差 100 倍: 实测 `000001.SH`/`399001.SZ`/`399006.SZ`/`000016.SH` 的日K `volume_lots` 恰为当日快照 `total_hand` 的 1/100(当日成分股快照之和与指数快照一致), 故指数 K 线成交量 ×100 还原为手; 股票/ETF 无此偏差
   - 报价协议单请求上限 80 只(超出静默截断, 整批上千只直接断流): `realtime`、指数补拉与 `depth5` 都自行按 80 只切批; 全市场 A 股 + ETF 约 7200 条实测 ~6 秒, 故 `realtime_min_interval = 30`
@@ -431,8 +457,8 @@ uv run --extra dev python -m ruff check app/plugins/<your_plugin>/ tests/test_<y
   - 指数不混入全市场快照: 通达信"指数"代码表含约 3000 只板块/题材指数, `realtime` 只收 A 股 + ETF, 指数走可选协议 `get_realtime_indices` 按需单拉(失败返回 `None`, 让上层保留上轮指数缓存)
   - K 线分页: `bars.get` 的 `start` 是**相对最新一根的偏移量**且单页上限 800 根, 按窗口起点逐页向前回溯, 带页数上限(82 页 ≈ 1990 年至今日K)与"本页时间不可解析即停止"的兜底
   - `adj_factor` 推导: 取 `corporate.capital_changes` 的除权除息事件(每 10 股口径 c1=现金分红 c2=配股价 c3=送转股 c4=配股)与事件日前的原始日K收盘价, 按 `参考价 = (前收盘×10 − 现金分红 + 配股×配股价) / (10 + 送转股 + 配股)` 得**单事件**比值; 不使用上游逐日前/后复权仿射系数, 那与"单事件因子 + 管道自行累积"的契约不同构
-  - 不声明 `financial`(上游只有简版财务批量字段)与 `full_minute`(按标的拉取撑不住盘中全市场分钟落盘); `fallback_to_tickflow_on_error: false` 来源隔离, 故障时返回明确空结果
-  - `tests/test_eltdx_provider.py` — 121 个契约测试(单位换算与指数成交量口径、分页方向与页数上限、80 只切批、五档价与缺档、成交方向的内外盘映射与 80 只切批/软失败、全市场竞价扫描的归一与翻页/页数上限/去重/软失败、概念板块分组的折叠与软失败三态、除权因子公式、能力声明、availability 两态、loader 注册); `tests/test_eltdx_desktop_packaging.py` — 桌面打包静态契约; `tests/test_auction_scan.py` — 竞价扫描服务契约(状态机、落盘与 TTL 缓存、竞价量比与阈值、名称补全, 全离线)
+  - 声明 `full_minute` 但只实现 `get_intraday_batch`: 通达信没有 `intraday.universe` 那种单请求全市场端点, 拿不到廉价增量, 因此故意不实现 `get_intraday_latest`, 由服务按「仅修复轮」调度 (节奏下限 60s; 每轮重拉当日窗口幂等覆盖, 单只标的失败不会留下永久空洞)。盘后全市场分钟落盘 (`supports_minute_universe_sync`) 是另一条能力 (见上), 与 `full_minute` 不互相代替; 不声明 `financial`(上游只有简版财务批量字段)。`fallback_to_tickflow_on_error: false` 来源隔离, 故障时返回明确空结果
+  - `tests/test_eltdx_provider.py` — 130 个契约测试(单位换算与指数成交量口径、分页方向与页数上限、80 只切批、五档价与缺档、成交方向的内外盘映射与 80 只切批/软失败、全市场竞价扫描的归一与翻页/页数上限/去重/软失败、概念板块分组的折叠与软失败三态、除权因子公式、`iter_minute` 分批与进度/部分失败、全量分钟当日窗口与取数根数收敛、能力声明、availability 两态、loader 注册); `tests/test_eltdx_desktop_packaging.py` — 桌面打包静态契约; `tests/test_auction_scan.py` — 竞价扫描服务契约(状态机、落盘与 TTL 缓存、竞价量比与阈值、名称补全, 全离线)
 
 ## 路由机制(无需关心, 仅参考)
 

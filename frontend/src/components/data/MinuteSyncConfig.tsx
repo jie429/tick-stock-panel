@@ -26,6 +26,10 @@ export function MinuteSyncConfig({ hasCap, onJobStart }: { hasCap: boolean; onJo
   const effectiveEnabled = enabled && hasUniverseSync
   const days = prefs.data?.minute_sync_days ?? 5
   const segmentDays = prefs.data?.minute_sync_segment_days ?? 20
+  // 生效分钟源声明的 1 分钟历史深度(交易日): 未声明视为深历史, 长跨度按 1 年请求。
+  // 声明了深度的浅源(如按标的请求的免费 TCP 源)按该深度收口, 避免发起取不到的窗口。
+  const historyDays = prefs.data?.minute_history_days ?? null
+  const longSpanDays = historyDays ?? 365
   const [localDays, setLocalDays] = useState(days)
   const [localSegment, setLocalSegment] = useState(segmentDays)
 
@@ -64,8 +68,8 @@ export function MinuteSyncConfig({ hasCap, onJobStart }: { hasCap: boolean; onJo
   const [fetchingMode, setFetchingMode] = useState<'' | '40d' | '1y'>('')
   const handleFetch = async (mode: '40d' | '1y') => {
     if (!hasUniverseSync) return
-    // 单次获取 = 按「分段大小」拉一段 (向前扩展); 1年 = 拉365天按分段切多段
-    const fetchDays = mode === '40d' ? localSegment : 365
+    // 单次获取 = 按「分段大小」拉一段 (向前扩展); 长跨度 = 拉满该源可用历史深度
+    const fetchDays = mode === '40d' ? localSegment : longSpanDays
     setFetchingMode(mode)
     try {
       const res = await api.syncMinute(fetchDays, true)
@@ -193,13 +197,13 @@ export function MinuteSyncConfig({ hasCap, onJobStart }: { hasCap: boolean; onJo
           {fetchingMode === '1y' ? (
             <><Loader2 className="h-3.5 w-3.5 animate-spin" /><span>分段获取中…</span></>
           ) : (
-            <><Calendar className="h-3.5 w-3.5" /><span>获取最近 1 年</span><span className="text-[9px] opacity-70">分段拉取</span></>
+            <><Calendar className="h-3.5 w-3.5" /><span>获取最近 {historyDays ? `${historyDays} 交易日` : '1 年'}</span><span className="text-[9px] opacity-70">{historyDays ? '源历史上限' : '分段拉取'}</span></>
           )}
         </button>
         </div>
         <div className="text-[10px] text-muted leading-relaxed">
           {hasUniverseSync
-            ? <>A股标的 · 前复权价格 · 从本地最早数据向前叠加 · 均按上方「分段大小」分段拉取、每段即落盘</>
+            ? <>A股标的 · 从本地最早数据向前叠加 · 价格随分钟复权基准(未迁移时不投影) · 每批拉完即落盘</>
             : <>{universeSyncHint}</>}
         </div>
       </div>

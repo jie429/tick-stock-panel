@@ -1752,6 +1752,8 @@ def sync_and_persist_minute(
     on_chunk_done(current, total) 每个 chunk 完成后回调。
     force_full_days=True 时强制回溯 days 自然日 (不增量补, 用于个股补齐历史)。
     universe_sync=True 仅供全市场入口调用; 按标的/分组请求保持 False。
+    自定义分钟源实现可选契约 ``iter_minute`` 时逐批消费并逐批落盘 (与 iter_daily
+    同形的流式口径), 峰值内存 = provider 单批; 未实现时保持一次性 get_minute。
     """
     if asset_type not in {"stock", "etf"}:
         raise ValueError(f"分钟K落库不支持资产类型: {asset_type}")
@@ -1761,7 +1763,7 @@ def sync_and_persist_minute(
     # resolver 调用统一走 _resolve_minute_provider, 与 _try_custom_minute 共用异常边界。
     # resolver 异常时视为非 custom (minute_is_custom=False), 走 capset 检查 →
     # sync_minute_batch 内 _try_custom_minute 会再次 resolver 异常 → fallback TickFlow。
-    _, fallback, resolve_err = _resolve_minute_provider(minute_provider)
+    minute_provider_obj, fallback, resolve_err = _resolve_minute_provider(minute_provider)
     minute_is_custom = not fallback
     if resolve_err is not None:
         logger.warning("custom minute provider %s resolution failed at sync_and_persist_minute, treating as non-custom: %s",
@@ -1834,17 +1836,46 @@ def sync_and_persist_minute(
             written_box[0] += _write_minute_partition(seg_df, minute_dir)
 
     segment_days = preferences.get_minute_sync_segment_days()
-    sync_minute_batch(
-        symbols, start_time=start_time, end_time=end_time,
-        batch_size=limit.batch, rpm=limit.rpm,
-        on_chunk_done=on_chunk_done,
-        segment_trading_days=segment_days,
-        on_segment=_persist,
-        asset_type=asset_type,
-        raise_on_source_error=True,
-        failed_out=failed_symbols,
-        raw_basis=minute_adjust.minute_basis_is_raw(repo.store.data_dir),
+    raw_basis = minute_adjust.minute_basis_is_raw(repo.store.data_dir)
+    # 按标的请求的插件源可实现 iter_minute 流式契约: 每批 yield 一帧, 这里逐批落盘,
+    # 不必把整池标的的分钟K先攒成一个 DataFrame (全市场 1 年 ≈ 上亿行, 既 OOM 又让
+    # "每段拉完即写盘"的流式口径失效)。未实现时保持原有一次性 get_minute 路径。
+    #
+    # 门控用显式声明 (supports_minute_universe_sync is True) 而不是单纯 callable():
+    # MagicMock 之类的替身对象任何属性都可调用, 只查 callable 会把它们误判成流式源。
+    supports_stream = getattr(minute_provider_obj, "supports_minute_universe_sync", False) is True
+    iter_minute = (
+        getattr(minute_provider_obj, "iter_minute", None)
+        if minute_is_custom and supports_stream
+        else None
     )
+    if callable(iter_minute):
+        try:
+            for chunk_df in iter_minute(
+                symbols, start_time=start_time, end_time=end_time,
+                asset_type=asset_type, freq="1m",
+                on_chunk_done=on_chunk_done, failed_out=failed_symbols,
+            ):
+                if not chunk_df.is_empty():
+                    _persist(chunk_df)
+        except MinuteProviderError:
+            raise
+        except Exception as e:
+            # 与 raise_on_source_error=True 同口径: 落库同步必须显式失败, 不能把来源
+            # 故障伪装成"同步 0 行成功"; 已落盘分区由下方 written>0 分支刷新视图。
+            raise MinuteProviderError(f"分钟K Provider {minute_provider} 拉取失败: {e}") from e
+    else:
+        sync_minute_batch(
+            symbols, start_time=start_time, end_time=end_time,
+            batch_size=limit.batch, rpm=limit.rpm,
+            on_chunk_done=on_chunk_done,
+            segment_trading_days=segment_days,
+            on_segment=_persist,
+            asset_type=asset_type,
+            raise_on_source_error=True,
+            failed_out=failed_symbols,
+            raw_basis=raw_basis,
+        )
 
     written = written_box[0]
     if written:

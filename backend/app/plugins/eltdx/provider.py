@@ -5,15 +5,18 @@ eltdx 自身可作 MCP / HTTP 服务运行; 项目后端不依赖外部进程, �
 
 - ``daily``     股票/ETF/指数不复权原始日K, ``volume_lots`` 原生为手;
 - ``adj_factor`` 由除权除息事件按交易所公式推导的单事件比值, 与 fuyao 同口径;
-- ``minute``    按标的 1 分钟 OHLCV, 实测历史约 100 个交易日;
+- ``minute``    按标的 1 分钟 OHLCV, 实测历史约 100 个交易日; 全市场落盘由
+  ``iter_minute`` 分批 yield + kline_sync 逐批写盘承接 (峰值内存 = 单批);
 - ``realtime``  全市场 A 股 + ETF 快照 (TCP 报价单请求上限 80 只, 自行分批);
-- ``depth5``    五档盘口 (五档价 + 量), 缺档保留 None。
+- ``depth5``    五档盘口 (五档价 + 量), 缺档保留 None;
+- ``full_minute`` 盘中全市场当日 1 分钟K 落盘 (``get_intraday_batch``): 通达信没有
+  单请求全市场端点, 只能按标的请求, 因此由 ``minute_refresh`` 按"仅修复轮"调度
+  (每轮重拉当日窗口并幂等覆盖, 缺口靠重复覆盖自愈, 而不是增量拼接)。
 
 另提供两个可选协议 (不在 datasets 声明内, 由上层按需鸭子类型调用):
 ``get_board_groups`` 通达信概念板块分组, ``get_trade_flow`` 成交方向 (内盘/外盘)。
 
-不声明 ``financial``(上游只有简版财务批量字段)与 ``full_minute``(按标的拉取,
-承受不了盘中全市场分钟落盘)。
+不声明 ``financial``(上游只有简版财务批量字段)。
 """
 from __future__ import annotations
 
@@ -22,7 +25,8 @@ import math
 import re
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
@@ -36,12 +40,24 @@ from app.plugins.eltdx import bridge
 
 logger = logging.getLogger(__name__)
 
-_DATASETS = ("daily", "adj_factor", "minute", "realtime", "depth5")
+_DATASETS = ("daily", "adj_factor", "minute", "full_minute", "realtime", "depth5")
 _CN_TZ = ZoneInfo("Asia/Shanghai")
 # 通达信 K 线单页上限 800 根; ``bars.get`` 的 start 是相对最新一根的偏移量。
 _KLINE_PAGE_SIZE = 800
 # 82 页 x 800 根覆盖 1990 年至今的日K; 分钟K 远小于此, 仅作死循环兜底。
 _MAX_KLINE_PAGES = 82
+# 全市场分钟K按标的落盘的单批预算: 1m 每交易日 240 根, 单批行数 = 标的数 x 窗口根数。
+# 5000+ 只若一次性建成 DataFrame 会先攒出百万级行 dict, 因此 iter_minute 按窗口长度
+# 反推单批标的数, 把 provider 内峰值内存压在单批 (见 _minute_universe_chunk_size)。
+_MINUTE_UNIVERSE_CHUNK_ROWS = 400_000
+_MINUTE_UNIVERSE_MAX_SYMBOLS = 500
+_MINUTE_BARS_PER_TRADING_DAY = 240
+# 分钟K批内并发度; 真实并发由连接池 (bridge.create_client 的 pool_size) 收口。
+_MINUTE_FETCH_WORKERS = 8
+# 全量分钟 (full_minute) 的当日窗口: 09:25 (含集合竞价末段) 到收盘, 收盘后截断;
+# 盘前得到 end < start 的空窗口, 由调用方返回空帧而不是拉上一交易日的整页。
+_INTRADAY_WINDOW_START_HM = (9, 25)
+_INTRADAY_WINDOW_END_HM = (15, 0)
 # 报价协议单请求上限 80 只: 实测请求 200 只只回 80 只, 整批上千只会直接断流。
 _QUOTE_BATCH_SIZE = 80
 # 除权事件接口上游默认批量。
@@ -272,6 +288,49 @@ def _volume_scale(asset_type: AssetType | str) -> float:
     return _INDEX_VOLUME_SCALE if str(asset_type).lower() == "index" else 1.0
 
 
+def _chunked(items: list[str], size: int) -> list[list[str]]:
+    """按固定标的数切块 (插件自洽, 不反向依赖 kline_sync 的工具函数)。"""
+    return [items[index:index + size] for index in range(0, len(items), size)]
+
+
+def _minute_universe_chunk_size(
+    start_time: datetime | None,
+    end_time: datetime | None,
+) -> int:
+    """全市场分钟K单个批次的标的数: 由窗口长度反推, 保证单批峰值行数有上界。
+
+    1 分钟K 每只每交易日 240 根, 窗口越长单只行数越多, 批越小。窗口按自然日折算
+    交易日 (x5/7, 向下取整天然留出节假日余量), 行数预算见
+    ``_MINUTE_UNIVERSE_CHUNK_ROWS``。两个端点都是北京墙钟, 与请求窗口同口径。
+    """
+    if start_time is not None and end_time is not None:
+        span_days = max(1, (_beijing_naive(end_time) - _beijing_naive(start_time)).days)
+    else:
+        span_days = 1
+    trading_days = span_days * 5 // 7 + 1
+    bars_per_symbol = trading_days * _MINUTE_BARS_PER_TRADING_DAY
+    chunk_size = _MINUTE_UNIVERSE_CHUNK_ROWS // bars_per_symbol
+    return max(1, min(_MINUTE_UNIVERSE_MAX_SYMBOLS, chunk_size))
+
+
+def _intraday_window(now: datetime) -> tuple[datetime, datetime]:
+    """全量分钟当日窗口 [09:25, min(now, 15:00)] (北京墙钟 naive)。
+
+    盘前 (或早于 09:25 的时点) 得到 end <= start, 调用方据此返回空帧:
+    不能把上一交易日的数据当成当日增量写进当日分区。
+    """
+    wallclock = _beijing_naive(now)
+    start = wallclock.replace(
+        hour=_INTRADAY_WINDOW_START_HM[0], minute=_INTRADAY_WINDOW_START_HM[1],
+        second=0, microsecond=0,
+    )
+    close = wallclock.replace(
+        hour=_INTRADAY_WINDOW_END_HM[0], minute=_INTRADAY_WINDOW_END_HM[1],
+        second=0, microsecond=0,
+    )
+    return start, min(wallclock, close)
+
+
 class EltdxProvider:
     """免费通达信行情数据源。
 
@@ -284,8 +343,9 @@ class EltdxProvider:
     # 通达信代码表能区分股票/ETF/指数, 且日K对三类都有独立记录布局。
     daily_asset_types = frozenset({"stock", "etf", "index"})
     instrument_asset_types = frozenset({"stock", "etf", "index"})
-    # 分钟K按标的请求, 不能承接全市场分钟落盘。
-    supports_minute_universe_sync = False
+    # 通达信没有全市场分钟端点, 但 ``iter_minute`` 按窗口长度收缩单批标的数并逐批
+    # yield, kline_sync 消费时边拉边落盘 (峰值内存 = 单批), 因此可承接全市场落盘。
+    supports_minute_universe_sync = True
     # 2026-09 实测 1m 历史约 100 个交易日; 保守暴露为 90, 避免 UI 承诺深历史。
     minute_history_days = 90
     # TCP 源异常时返回明确空结果, 不因本机仍有 TickFlow 配置而暗中换源。
@@ -445,13 +505,22 @@ class EltdxProvider:
         start_time: datetime | None,
         *,
         daily: bool,
+        max_bars: int | None = None,
     ) -> list[Any]:
         """按窗口向前回溯分页取原始 K 线。
 
         单页上限 800 根且 ``start`` 是相对最新一根的偏移量, 因此从最新一页依次
         向前翻, 直到本页最早时间覆盖窗口起点、返回不足一页、或触到页数上限。
         ``start_time`` 为 None 时取上游可提供的全历史 (仍受页数上限约束)。
+
+        ``max_bars`` 有值时只取最新 max_bars 根且不翻页 (调用方已按窗口算准根数):
+        当日窗口若仍按 800 根整页拉, 每只标的都会把上一交易日的数据也传一遍。
         """
+        if max_bars is not None:
+            limit = max(1, min(int(max_bars), _KLINE_PAGE_SIZE))
+            page = client.bars.get(tdx_symbol, period=period, start=0, count=limit)
+            return list(getattr(page, "bars", None) or ())
+
         target: Any = None
         if start_time is not None:
             wallclock = _beijing_naive(start_time)
@@ -631,6 +700,90 @@ class EltdxProvider:
         return self._frame(rows, _DAILY_SCHEMA).sort(["symbol", "date"])
 
     # ---- 分钟K ----
+    def iter_minute(
+        self,
+        symbols: list[str],
+        start_time: datetime | None,
+        end_time: datetime | None,
+        asset_type: AssetType | str = "stock",
+        freq: str = "1m",
+        on_chunk_done: Callable[[int, int], None] | None = None,
+        failed_out: list[str] | None = None,
+        max_bars: int | None = None,
+    ) -> Iterator[pl.DataFrame]:
+        """按标的并发拉取 1 分钟 OHLCV, 每批 yield 一帧 (与 ``iter_daily`` 同形)。
+
+        通达信没有全市场分钟端点, 全市场落盘只能按标的请求。单批标的数由
+        ``_minute_universe_chunk_size`` 按窗口长度反推 (窗口越长、单只行数越多, 批
+        越小), 消费方逐批写盘, 峰值内存 = 单批而非整池标的的行。批内按标的并发:
+        单只一次 TCP 往返, 每条请求各占一个连接池槽位, 真实并发由连接池收口。
+        全部标的失败时抛 RuntimeError; 部分失败写 ``failed_out`` 并照常 yield 成功批。
+        ``max_bars`` 透传给 ``_fetch_bars``: 当日窗口只取所需根数而不拉满整页。
+        """
+        if str(freq).lower() not in {"1m", "1min", "1minute"}:
+            raise ValueError(f"eltdx 仅支持 1m 分钟K, 得到: {freq!r}")
+        if not symbols:
+            return
+
+        volume_scale = _volume_scale(asset_type)
+        total = len(symbols)
+        done = 0
+        produced = False
+        failures: list[str] = []
+        failed_symbols: list[str] = []
+        with self._client_session() as client:
+
+            def _fetch(symbol: str) -> tuple[str, list[dict] | None, Exception | None]:
+                # 单标的独立容错: 异常作为返回值上交, 不让一只标的拖垮整批。
+                label = str(symbol or "").strip().upper()
+                try:
+                    tdx_symbol = _to_tdx_symbol(symbol)
+                    canonical_symbol, _, _ = _from_tdx_symbol(tdx_symbol)
+                    label = canonical_symbol
+                    bars = self._fetch_bars(
+                        client, tdx_symbol, "1m", start_time, daily=False,
+                        max_bars=max_bars,
+                    )
+                    return (
+                        label,
+                        self._minute_rows(
+                            canonical_symbol, bars, start_time, end_time, volume_scale,
+                        ),
+                        None,
+                    )
+                except Exception as exc:
+                    return (label, None, exc)
+
+            for batch in _chunked(symbols, _minute_universe_chunk_size(start_time, end_time)):
+                rows: list[dict] = []
+                # map 保序: 进度回调与 failed_out 的顺序与逐股串行时一致。
+                with ThreadPoolExecutor(
+                    max_workers=min(len(batch), _MINUTE_FETCH_WORKERS),
+                ) as pool:
+                    for label, symbol_rows, exc in pool.map(_fetch, batch):
+                        done += 1
+                        if exc is not None:
+                            failures.append(f"{label}: {exc}")
+                            failed_symbols.append(label)
+                            logger.warning("eltdx 分钟K %s 拉取失败: %s", label, exc)
+                        elif symbol_rows:
+                            rows.extend(symbol_rows)
+                            produced = True
+                        if on_chunk_done is not None:
+                            on_chunk_done(done, total)
+                if rows:
+                    yield self._frame(rows, _MINUTE_SCHEMA).sort(["symbol", "datetime"])
+
+        if failed_symbols:
+            logger.warning(
+                "eltdx 分钟K部分失败: %d/%d 标的未获取 (样例: %s)",
+                len(failed_symbols), total, failed_symbols[:10],
+            )
+            if failed_out is not None:
+                failed_out.extend(failed_symbols)
+        if failures and not produced:
+            raise RuntimeError(f"eltdx 分钟K请求全部失败 ({'; '.join(failures[:3])})")
+
     def get_minute(
         self,
         symbols: list[str],
@@ -645,50 +798,51 @@ class EltdxProvider:
 
         用 ``bars.get(period='1m')`` 而不是 ``minutes.today``: 后者只有价量、不带
         OHLC, 且时间标签没有日期, 无法满足项目"北京墙钟 naive"的入库契约。
+        实现与 ``iter_minute`` 同源, 只是把分批结果合成单帧。
         """
-        if str(freq).lower() not in {"1m", "1min", "1minute"}:
-            raise ValueError(f"eltdx 仅支持 1m 分钟K, 得到: {freq!r}")
-        if not symbols:
+        frames = list(
+            self.iter_minute(
+                symbols, start_time=start_time, end_time=end_time,
+                asset_type=asset_type, freq=freq,
+                on_chunk_done=on_chunk_done, failed_out=failed_out,
+            ),
+        )
+        if not frames:
             return self._frame([], _MINUTE_SCHEMA)
+        return pl.concat(frames, how="diagonal_relaxed").sort(["symbol", "datetime"])
 
-        rows: list[dict] = []
-        failures: list[str] = []
-        failed_symbols: list[str] = []
-        total = len(symbols)
-        with self._client_session() as client:
-            for index, symbol in enumerate(symbols):
-                failed_symbol = str(symbol or "").strip().upper()
-                try:
-                    tdx_symbol = _to_tdx_symbol(symbol)
-                    canonical_symbol, _, _ = _from_tdx_symbol(tdx_symbol)
-                    failed_symbol = canonical_symbol
-                    bars = self._fetch_bars(
-                        client, tdx_symbol, "1m", start_time, daily=False,
-                    )
-                    rows.extend(
-                        self._minute_rows(
-                            canonical_symbol, bars, start_time, end_time,
-                            _volume_scale(asset_type),
-                        ),
-                    )
-                except Exception as exc:
-                    failures.append(f"{failed_symbol}: {exc}")
-                    failed_symbols.append(failed_symbol)
-                    logger.warning("eltdx 分钟K %s 拉取失败: %s", failed_symbol, exc)
-                finally:
-                    if on_chunk_done is not None:
-                        on_chunk_done(index + 1, total)
+    # ---- 全量分钟 (full_minute) 修复轮 ----
+    def get_intraday_batch(
+        self,
+        symbols: list[str],
+        count: int = 300,
+        asset_type: AssetType | str = "stock",
+    ) -> pl.DataFrame:
+        """当日窗口全市场 1 分钟K 批量拉取 (full_minute 修复轮, canonical 8 列)。
 
-        if failed_symbols:
-            logger.warning(
-                "eltdx 分钟K部分失败: %d/%d 标的未获取 (样例: %s)",
-                len(failed_symbols), total, failed_symbols[:10],
-            )
-            if failed_out is not None:
-                failed_out.extend(failed_symbols)
-        if failures and not rows:
-            raise RuntimeError(f"eltdx 分钟K请求全部失败 ({'; '.join(failures[:3])})")
-        return self._frame(rows, _MINUTE_SCHEMA).sort(["symbol", "datetime"])
+        通达信没有单请求全市场分钟端点, 增量同样只能按标的把全市场再拉一遍, 没有
+        廉价增量端点可用, 因此本源不实现 ``get_intraday_latest``: ``minute_refresh``
+        会据此按"仅修复轮"调度 (节奏下限 60s), 每轮把当日窗口整段重拉并幂等覆盖。
+        缺口靠重复覆盖自愈而不是增量拼接 —— 单只标的失败不会在分区里留下永久空洞。
+
+        与 ``get_minute`` 同源: 按窗口长度分批 + 批内并发, 逐批 yield 后合成一帧。
+        单只标的只取窗口内需要的根数 (``count`` 与"09:25 至今分钟数"取小), 不用
+        默认的 800 根整页: 全市场 5000+ 只的传输量按窗口长度收敛, 盘初只拉几十根。
+        """
+        start, end = _intraday_window(datetime.now(_CN_TZ))
+        if end <= start:
+            return self._frame([], _MINUTE_SCHEMA)
+        window_bars = int((end - start).total_seconds() // 60) + 2
+        max_bars = min(max(1, int(count)), window_bars, _KLINE_PAGE_SIZE)
+        frames = list(
+            self.iter_minute(
+                symbols, start, end,
+                asset_type=asset_type, freq="1m", max_bars=max_bars,
+            ),
+        )
+        if not frames:
+            return self._frame([], _MINUTE_SCHEMA)
+        return pl.concat(frames, how="diagonal_relaxed").sort(["symbol", "datetime"])
 
     # ---- 除权因子 ----
     def get_adj_factors(
@@ -1204,6 +1358,8 @@ class EltdxProvider:
                 return self._preview(dataset, self.get_adj_factors(selected, start_time, end_time))
             if dataset == "minute":
                 return self._preview(dataset, self.get_minute(selected[:1], start_time, end_time))
+            if dataset == "full_minute":
+                return self._preview(dataset, self.get_intraday_batch(selected[:1]))
             if dataset == "realtime":
                 rows = self.get_realtime()
                 return {

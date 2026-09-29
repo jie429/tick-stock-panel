@@ -96,4 +96,6 @@ def create_client():
         client_cls = _client_class()
     except ImportError as exc:
         raise EltdxBridgeError(f"缺少 eltdx 依赖: {exc}") from exc
-    return client_cls(timeout=8.0, pool_size=2, probe_hosts=False)
+    # pool_size 取 eltdx 默认布局 (2 台服务器 x 4 条连接): 分钟K按标的请求, 单批
+    # 的并发度直接由连接池收口, 只有 2 条连接时全市场批内并发被压到 2。
+    return client_cls(timeout=8.0, pool_size=8, probe_hosts=False)

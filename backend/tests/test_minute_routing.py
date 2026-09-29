@@ -602,6 +602,66 @@ def test_sync_and_persist_minute_etf_uses_dedicated_store(monkeypatch, tmp_path)
     assert repo.get_minute("510300.SH", date(2026, 1, 15), asset_type="stock").is_empty()
     assert (tmp_path / "kline_etf_minute" / "date=2026-01-15" / "part.parquet").exists()
 
+# ---------- 测试 12b: sync_and_persist_minute 消费 iter_minute 流式契约 ----------
+
+def test_sync_and_persist_minute_streams_iter_minute(monkeypatch, tmp_path):
+    """插件源声明全市场分钟落盘并实现 iter_minute 时, 逐批落盘 (每批一次写分区)。
+
+    全市场分钟K按标的请求的源只有分批 yield 才可能落盘 (整池标的攒成一个
+    DataFrame 会 OOM), 因此 iter_minute 可用时不得回落到一次性 get_minute。
+    """
+    from app.tickflow.capabilities import Cap, CapabilityLimits, CapabilitySet
+
+    frames = [_mock_minute_df("600519.SH"), _mock_minute_df("000001.SZ")]
+
+    class _StreamingProvider:
+        supports_minute_universe_sync = True
+
+        def __init__(self):
+            self.minute_calls = 0
+
+        def iter_minute(self, symbols, start_time=None, end_time=None, asset_type="stock",
+                        freq="1m", on_chunk_done=None, failed_out=None):
+            assert symbols == ["600519.SH", "000001.SZ"]
+            for index, frame in enumerate(frames):
+                if on_chunk_done is not None:
+                    on_chunk_done(index + 1, len(frames))
+                yield frame
+
+        def get_minute(self, *args, **kwargs):  # pragma: no cover - 回落到这里即为回归
+            self.minute_calls += 1
+            raise AssertionError("iter_minute 可用时不应回落到一次性 get_minute")
+
+    provider = _StreamingProvider()
+    _setup_custom_provider(monkeypatch, provider, has_dataset=True)
+
+    monkeypatch.setattr(kline_sync, "_cleanup_null_datetime_minute", lambda *_args: None)
+    monkeypatch.setattr(kline_sync, "_migrate_symbol_to_date_partition", lambda *_args: None)
+    monkeypatch.setattr(kline_sync, "_latest_minute_datetime", lambda *_args: None)
+    monkeypatch.setattr(kline_sync, "resolve_limit", lambda *a, **kw: MagicMock(batch=100, rpm=30))
+    monkeypatch.setattr(kline_sync.preferences, "get_minute_sync_segment_days", lambda: 20)
+    monkeypatch.setattr(kline_sync, "cn_now", lambda: datetime(2026, 9, 4, 15, 5))
+
+    write_spy = MagicMock(return_value=1)
+    monkeypatch.setattr(kline_sync, "_write_minute_partition", write_spy)
+
+    mock_repo = MagicMock()
+    mock_repo.store.data_dir = tmp_path
+    mock_repo.db.execute = MagicMock()
+
+    written = kline_sync.sync_and_persist_minute(
+        ["600519.SH", "000001.SZ"], mock_repo,
+        CapabilitySet({Cap.KLINE_MINUTE_BATCH: CapabilityLimits()}),
+        universe_sync=True,
+    )
+
+    assert write_spy.call_count == 2
+    assert [call.args[0]["symbol"][0] for call in write_spy.call_args_list] == [
+        "600519.SH", "000001.SZ",
+    ]
+    assert written == 2
+    assert provider.minute_calls == 0
+
 
 # ---------- 测试 13: get_provider 异常时 fall through TickFlow (Issue 2) ----------
 
