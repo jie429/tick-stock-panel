@@ -9,7 +9,6 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from app.custom.dragon_quant import router, service
-from app.custom.dragon_quant.account import DragonAccountConfig, run_account_backtest
 from app.custom.dragon_quant.data import (
     DragonDataError,
     DragonScanOptions,
@@ -18,7 +17,6 @@ from app.custom.dragon_quant.data import (
     _prepare_daily,
     _ranked_industry_samples,
     build_scan_input,
-    load_account_market_data,
 )
 from app.custom.dragon_quant.models import DragonCandidate, DragonScanInput
 from app.custom.dragon_quant.scoring import score_scan
@@ -90,87 +88,6 @@ def test_score_scan_ranks_only_candidates_passing_hard_floors() -> None:
     assert result[0]["dimensions"]["liquidity"]["details"]["degraded"] is True
     assert result[1]["is_true_dragon"] is False
     assert result[1]["reject_reason"]
-
-
-def test_account_backtest_enforces_t1_and_sells_half_on_next_day_limit_up() -> None:
-    days = [date(2026, 9, 7), date(2026, 9, 8), date(2026, 9, 9)]
-    daily = {
-        "600001.SH": [
-            {
-                "date": days[0], "open": 10.0, "high": 10.5, "low": 9.8,
-                "close": 10.0, "raw_close": 10.0, "ma5": 10.0,
-                "amount": 500_000_000.0, "turnover_rate": 12.0,
-                "volume": 100_000.0, "signal_limit_up": False,
-            },
-            {
-                "date": days[1], "open": 10.1, "high": 11.11, "low": 10.0,
-                "close": 11.11, "raw_close": 11.11, "ma5": 10.0,
-                "amount": 600_000_000.0, "turnover_rate": 12.0,
-                "volume": 100_000.0, "signal_limit_up": True,
-            },
-            {
-                "date": days[2], "open": 11.2, "high": 12.22, "low": 11.0,
-                "close": 12.22, "raw_close": 12.22, "ma5": 10.5,
-                "amount": 600_000_000.0, "turnover_rate": 12.0,
-                "volume": 100_000.0, "signal_limit_up": True,
-            },
-        ]
-    }
-    scans = {
-        days[0]: [{
-            "symbol": "600001.SH", "name": "强龙", "rank": 1,
-            "composite_score": 80.0, "is_true_dragon": True,
-        }]
-    }
-
-    result = run_account_backtest(
-        trading_days=days,
-        daily_by_symbol=daily,
-        scans_by_date=scans,
-        minute_by_symbol_date={},
-        config=DragonAccountConfig(initial_cash=100_000.0, max_positions=1),
-    )
-
-    assert [trade["side"] for trade in result["trades"]] == ["buy", "sell"]
-    assert result["trades"][0]["trade_date"] == "2026-09-08"
-    assert result["trades"][1]["trade_date"] == "2026-09-09"
-    assert result["trades"][1]["reason_code"] == "next_day_limit_up_half"
-    assert result["trades"][1]["quantity"] < result["trades"][0]["quantity"]
-
-
-def test_open_buy_does_not_use_same_day_close_liquidity() -> None:
-    days = [date(2026, 9, 7), date(2026, 9, 8)]
-    daily = {
-        "600001.SH": [
-            {
-                "date": days[0], "open": 10.0, "high": 10.2, "low": 9.9,
-                "close": 10.0, "raw_close": 10.0, "ma5": 10.0,
-                "amount": 50_000_000.0, "turnover_rate": 2.0,
-                "volume": 100_000.0, "signal_limit_up": False,
-            },
-            {
-                "date": days[1], "open": 10.1, "high": 10.8, "low": 10.0,
-                "close": 10.7, "raw_close": 10.7, "ma5": 10.0,
-                "amount": 1_000_000_000.0, "turnover_rate": 20.0,
-                "volume": 200_000.0, "signal_limit_up": False,
-            },
-        ]
-    }
-    scans = {days[0]: [{
-        "symbol": "600001.SH", "name": "候选", "rank": 1,
-        "composite_score": 80.0, "is_true_dragon": True,
-        "amount_yuan": 50_000_000.0, "turnover_rate_pct": 2.0,
-    }]}
-
-    result = run_account_backtest(
-        trading_days=days,
-        daily_by_symbol=daily,
-        scans_by_date=scans,
-        minute_by_symbol_date={},
-        config=DragonAccountConfig(initial_cash=100_000.0, max_positions=1),
-    )
-
-    assert result["trades"] == []
 
 
 def test_scan_service_fails_closed_when_critical_market_inputs_are_incomplete(
@@ -447,78 +364,6 @@ def test_prepare_daily_loads_historical_date_when_latest_is_newer() -> None:
 
     assert frame["date"].max() == target
     assert frame.filter(pl.col("date") == target)["prev_raw_close"][0] == 10.0
-
-
-def test_backtest_reports_missing_historical_scans(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path,
-) -> None:
-    days = [date(2026, 9, 7), date(2026, 9, 8), date(2026, 9, 9)]
-    repo = SimpleNamespace(
-        get_enriched_range=lambda *_args: pl.DataFrame({"date": days}),
-    )
-    monkeypatch.setattr(
-        service,
-        "load_account_market_data",
-        lambda *_args, **_kwargs: (days[1:], {}, {}),
-    )
-
-    record = service.run_backtest(
-        repo,
-        None,
-        tmp_path,
-        start=days[1],
-        end=days[2],
-        config=DragonAccountConfig(candidate_lookback_days=1),
-    )
-
-    assert record["warnings"]
-    assert "缺少 2 个交易日" in record["warnings"][0]
-    assert record["stats"]["trade_count"] == 0
-
-
-def test_account_minute_data_is_aggregated_to_closed_five_minute_bars(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    trade_date = date(2026, 9, 8)
-    daily = pl.DataFrame({
-        "symbol": ["600001.SH", "600001.SH"],
-        "date": [date(2026, 9, 7), trade_date],
-        "open": [10.0, 10.1],
-        "high": [10.2, 10.5],
-        "low": [9.9, 10.0],
-        "close": [10.0, 10.4],
-        "raw_close": [10.0, 10.4],
-        "prev_raw_close": [9.8, 10.0],
-        "volume": [100.0, 200.0],
-        "amount": [1_000.0, 2_000.0],
-        "name": ["样本", "样本"],
-    })
-    minute = pl.DataFrame({
-        "symbol": ["600001.SH"] * 5,
-        "datetime": [datetime(2026, 9, 8, 9, minute) for minute in range(31, 36)],
-        "open": [10.1, 10.2, 10.3, 10.4, 10.5],
-        "high": [10.2, 10.3, 10.4, 10.5, 10.6],
-        "low": [10.0, 10.1, 10.2, 10.3, 10.4],
-        "close": [10.2, 10.3, 10.4, 10.5, 10.6],
-        "volume": [1.0] * 5,
-        "amount": [100.0] * 5,
-    })
-    monkeypatch.setattr(
-        "app.custom.dragon_quant.data._prepare_daily",
-        lambda *_args, **_kwargs: daily,
-    )
-    repo = SimpleNamespace(get_minute_by_dates=lambda *_args, **_kwargs: minute)
-
-    _days, _daily, bars = load_account_market_data(
-        repo, ["600001.SH"], trade_date, trade_date,
-    )
-
-    first = bars[("600001.SH", trade_date)][0]
-    assert first["datetime"] == datetime(2026, 9, 8, 9, 35)
-    assert first["open"] == 10.1
-    assert first["close"] == 10.6
-    assert first["volume"] == 5.0
 
 
 def test_record_store_and_router_support_list_detail_delete(tmp_path) -> None:

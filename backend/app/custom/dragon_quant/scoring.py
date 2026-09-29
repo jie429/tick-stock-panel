@@ -71,7 +71,7 @@ def _early_seal(candidate: DragonCandidate, peers: list[DragonCandidate]) -> tup
 
 def _lead_sector(stock: MinuteCurve, industry: MinuteCurve) -> tuple[float, dict]:
     if not stock or not industry:
-        return 40.0, {"degraded": True, "reason": "个股或行业分钟线缺失"}
+        return 40.0, {"score": 40.0, "degraded": True, "reason": "个股或行业分钟线缺失"}
     _axis, (stock_values, industry_values) = _aligned(stock, industry)
     window = 3
     follow = 3
@@ -111,20 +111,21 @@ def _lead_sector(stock: MinuteCurve, industry: MinuteCurve) -> tuple[float, dict
     score = 0.0 if leads == 0 else _clip(
         70.0 + (leads - 1) * 10.0 - min(followers * 20.0, 100.0)
     )
-    return score, {"n_lead": leads, "n_follow": followers}
+    return score, {"score": round(score, 2), "n_lead": leads, "n_follow": followers}
 
 
 def _voice(industry: str, scan: DragonScanInput) -> tuple[float, dict]:
     members = scan.industry_members.get(industry, ())
     values = [scan.stock_change_pct[symbol] for symbol in members if symbol in scan.stock_change_pct]
     if not values:
-        return 0.0, {"degraded": True, "member_count": 0}
+        return 0.0, {"score": 0.0, "degraded": True, "member_count": 0}
     limit_count = sum(value >= 0.099 for value in values)
     strong_count = sum(value >= 0.03 for value in values)
     limit_ratio = limit_count / len(values)
     strong_ratio = strong_count / len(values)
     score = _clip(limit_ratio / 0.10 * 100.0) * 0.6 + _clip(strong_ratio / 0.30 * 100.0) * 0.4
     return _clip(score), {
+        "score": round(_clip(score), 2),
         "member_count": len(values),
         "limit_up_count": limit_count,
         "strong_count": strong_count,
@@ -141,7 +142,15 @@ def _drive(candidate: DragonCandidate, peers: list[DragonCandidate], scan: Drago
     return {
         "score": round(score, 2),
         "weight": DIM_WEIGHTS["drive"],
-        "details": {"early": early_detail, "lead": lead_detail, "voice": voice_detail},
+        "details": {
+            "early": {
+                "score": round(early, 2),
+                "sealed_volume_lots": candidate.sealed_volume_lots,
+                **early_detail,
+            },
+            "lead": lead_detail,
+            "voice": voice_detail,
+        },
     }
 
 
@@ -150,6 +159,7 @@ def _leadership(candidate: DragonCandidate, peers: list[DragonCandidate]) -> dic
     board_score = _clip(100.0 - (max_boards - candidate.board_count) * 10.0)
     returns = [item.five_day_return_pct for item in peers]
     return_score = _desc_rank(candidate.five_day_return_pct, returns)
+    rank = sum(1 for value in returns if value > candidate.five_day_return_pct) + 1
     score = _clip(board_score * 0.5 + return_score * 0.5)
     return {
         "score": round(score, 2),
@@ -157,8 +167,11 @@ def _leadership(candidate: DragonCandidate, peers: list[DragonCandidate]) -> dic
         "details": {
             "board_count": candidate.board_count,
             "industry_max_boards": max_boards,
+            "board_score": round(board_score, 2),
             "five_day_return_pct": round(candidate.five_day_return_pct, 2),
             "five_day_rank_score": round(return_score, 2),
+            "five_day_rank": rank,
+            "five_day_peer_count": len(returns),
         },
     }
 
@@ -189,11 +202,11 @@ def _dip_segments(values: list[float | None]) -> list[tuple[int, int]]:
 
 def _anti_drop_against(base: MinuteCurve, stock: MinuteCurve) -> tuple[float, dict]:
     if not base or not stock:
-        return 65.0, {"degraded": True}
+        return 65.0, {"score": 65.0, "degraded": True}
     _axis, (base_values, stock_values) = _aligned(base, stock)
     segments = _dip_segments(base_values)
     if not segments:
-        return 65.0, {"no_dip": True}
+        return 65.0, {"score": 65.0, "no_dip": True}
     weighted = 0.0
     denominator = 0.0
     for start, bottom in segments:
@@ -222,7 +235,9 @@ def _anti_drop_against(base: MinuteCurve, stock: MinuteCurve) -> tuple[float, di
     stock_rise = max(stock_after) - stock_start if stock_after and stock_start is not None else 0.0
     amplitude = _clip(stock_rise / max(base_rise, 1e-9), 0, 2) / 2.0 * 100.0
     rebound = lead * 0.6 + amplitude * 0.4
-    return _clip(hold_score * 0.6 + rebound * 0.4), {
+    score = _clip(hold_score * 0.6 + rebound * 0.4)
+    return score, {
+        "score": round(score, 2),
         "dip_segments": len(segments),
         "hold_score": round(hold_score, 2),
         "rebound_score": round(rebound, 2),
@@ -274,54 +289,121 @@ def _liquidity(candidate: DragonCandidate, peers: list[DragonCandidate]) -> dict
             "seal_strength": round(strength, 4) if strength is not None else None,
             "open_count": candidate.open_count,
             "degraded": degraded,
+            "absolute_score": round(absolute, 2),
+            "relative_score": round(relative, 2),
+            "turnover_score": round(turnover_score, 2),
+            "strength_score": round(strength_score, 2),
+            "stable_score": round(stable_score, 2),
+            "seal_score": round(seal_score, 2),
         },
     }
 
 
-def _absorption(industry: str, scan: DragonScanInput) -> dict:
-    event_scores: list[float] = []
-    for _day, curves in scan.industry_history.items():
+def _absorption_events(industry: str, scan: DragonScanInput) -> list[dict]:
+    """回看期内符合口径的承接窗口 (5 分钟桶), 带时间戳与同期回落板块。
+
+    只负责「发现与标注」: 事件打分公式与降级口径保持原样, 最终维度分不变。
+    """
+    events: list[dict] = []
+    for day, curves in scan.industry_history.items():
         target = curves.get(industry, [])
         if len(target) < 6:
             continue
-        for end in range(5, len(target)):
+        gains = [value for _point, value in target]
+        for end in range(5, len(gains)):
             start = end - 5
-            target_return = target[end] - target[start]
-            positives = sum(target[index] > target[index - 1] for index in range(start + 1, end + 1))
+            target_return = gains[end] - gains[start]
+            positives = sum(gains[index] > gains[index - 1] for index in range(start + 1, end + 1))
             if target_return <= 0.003 or positives < 4:
                 continue
-            falling = []
+            falling: list[tuple[str, float]] = []
             for other, values in curves.items():
                 if other == industry or len(values) <= end:
                     continue
-                change = values[end] - values[start]
+                other_gains = [value for _point, value in values]
+                change = other_gains[end] - other_gains[start]
                 if change < -0.003:
-                    falling.append(change)
+                    falling.append((other, change))
             if len(falling) < 2:
                 continue
-            peak = max(target[start:end + 1])
-            drawdown = max(0.0, peak - target[end]) / max(peak - target[start], 1e-9)
+            peak = max(gains[start:end + 1])
+            drawdown = max(0.0, peak - gains[end]) / max(peak - gains[start], 1e-9)
             if drawdown > 0.3:
                 continue
             target_score = min(target_return / 0.02, 1.0) * 100.0
-            flight_scale = abs(sum(falling) / len(falling) * 100.0) * len(falling)
+            flight_scale = abs(sum(change for _name, change in falling) / len(falling) * 100.0) * len(falling)
             flight_score = min(flight_scale / 5.0, 1.0) * 100.0
             intensity = target_score * 0.5 + flight_score * 0.5
             breadth = min(len(falling) / max(len(curves) - 1, 10), 1.0) * 100.0
             sustain = (1.0 - drawdown) * 100.0
-            event_scores.append(intensity * 0.4 + breadth * 0.2 + sustain * 0.4)
-    if not event_scores:
+            events.append({
+                "day": day,
+                "start_index": start,
+                "end_index": end,
+                "window_start": target[start][0],
+                "window_end": target[end][0],
+                "score": intensity * 0.4 + breadth * 0.2 + sustain * 0.4,
+                "target_return": target_return,
+                "falling": falling,
+            })
+    return events
+
+
+def _merge_absorption_runs(events: list[dict]) -> list[list[dict]]:
+    """把相邻窗口合并为「同一次独立承接」(同一交易日、窗口终点逐桶连续)。"""
+    runs: list[list[dict]] = []
+    for event in sorted(events, key=lambda item: (item["day"], item["end_index"])):
+        if (
+            runs
+            and runs[-1][-1]["day"] == event["day"]
+            and runs[-1][-1]["end_index"] + 1 == event["end_index"]
+        ):
+            runs[-1].append(event)
+        else:
+            runs.append([event])
+    return runs
+
+
+def _absorption(industry: str, scan: DragonScanInput) -> dict:
+    events = _absorption_events(industry, scan)
+    if not events:
         return {
             "score": 50.0,
             "weight": DIM_WEIGHTS["absorption"],
-            "details": {"event_count": 0, "fallback": True},
+            "details": {
+                "event_count": 0,
+                "merged_event_count": 0,
+                "fallback": True,
+            },
         }
+    event_scores = [event["score"] for event in events]
     best = max(event_scores)
     score = min(best + min((len(event_scores) - 1) * 5.0, 15.0), 100.0)
+    runs = _merge_absorption_runs(events)
+    ranked = sorted(events, key=lambda item: item["score"], reverse=True)[:3]
     return {
         "score": round(score, 2),
         "weight": DIM_WEIGHTS["absorption"],
-        "details": {"event_count": len(event_scores), "best_event_score": round(best, 2)},
+        "details": {
+            "event_count": len(event_scores),
+            "merged_event_count": len(runs),
+            "best_event_score": round(best, 2),
+            "top_events": [
+                {
+                    "day": event["day"].isoformat(),
+                    "window_start": event["window_start"].strftime("%H:%M"),
+                    "window_end": event["window_end"].strftime("%H:%M"),
+                    "score": round(event["score"], 2),
+                    "target_return_pct": round(event["target_return"] * 100.0, 2),
+                    "falling_count": len(event["falling"]),
+                    "falling": [
+                        {"industry": name, "change_pct": round(change * 100.0, 2)}
+                        for name, change in sorted(event["falling"], key=lambda pair: pair[1])[:5]
+                    ],
+                }
+                for event in ranked
+            ],
+        },
     }
 
 

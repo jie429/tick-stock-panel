@@ -76,12 +76,10 @@ export const QK = {
     : ['strategy-link-options'] as const,
   strategyDetail:       (id: string) => ['strategy-detail', id] as const,
 
-  // 二开: dragon-quant 五维选股与账户回测
+  // 二开: dragon-quant 五维选股
   dragonQuantStatus:    ['dragon-quant-status'] as const,
   dragonQuantScans:     ['dragon-quant-scans'] as const,
   dragonQuantScan:      (id: string) => ['dragon-quant-scan', id] as const,
-  dragonQuantBacktests: ['dragon-quant-backtests'] as const,
-  dragonQuantBacktest:  (id: string) => ['dragon-quant-backtest', id] as const,
 
   // Data / Pipeline
   dataStatus:           ['data-status'] as const,

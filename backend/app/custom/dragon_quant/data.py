@@ -10,7 +10,12 @@ from typing import Any
 
 import polars as pl
 
-from app.custom.dragon_quant.models import DragonCandidate, DragonScanInput, MinuteCurve
+from app.custom.dragon_quant.models import (
+    DragonCandidate,
+    DragonScanInput,
+    MinuteCurve,
+    MinuteHistorySeries,
+)
 from app.market_time import CN_TZ
 from app.price_limits import price_limit_pct
 from app.services import kline_sync
@@ -561,7 +566,7 @@ def build_scan_input(
     )
     relevant_symbols = sorted({symbol for values in history_samples.values() for symbol in values})
     historical_minute = repo.get_minute_by_dates(relevant_symbols, history_dates, asset_type="stock")
-    industry_history: dict[date, dict[str, list[float]]] = {}
+    industry_history: dict[date, dict[str, MinuteHistorySeries]] = {}
     if historical_minute.is_empty():
         optional_missing.append("absorption_minute_history")
     else:
@@ -580,7 +585,7 @@ def build_scan_input(
                 per_day.setdefault(point.date(), []).append((point, gain))
             for day, values in per_day.items():
                 industry_history.setdefault(day, {})[industry] = [
-                    gain for _point, gain in sorted(values)
+                    (point, gain) for point, gain in sorted(values)
                 ]
         covered_history = {
             industry
@@ -670,62 +675,3 @@ def build_scan_input(
             "fetch_errors": fetch_errors + index_fetch_errors,
         },
     )
-
-
-def load_account_market_data(
-    repo,
-    symbols: list[str],
-    start: date,
-    end: date,
-) -> tuple[list[date], dict[str, list[dict]], dict[tuple[str, date], list[dict]]]:
-    daily = _prepare_daily(repo, end, max((end - start).days + 30, 60)).filter(
-        (pl.col("date") >= start - timedelta(days=30)) & (pl.col("date") <= end)
-    )
-    if symbols:
-        daily = daily.filter(pl.col("symbol").is_in(symbols))
-    trading_days = [value for value in daily["date"].unique().sort().to_list() if start <= value <= end]
-    if not symbols:
-        return trading_days, {}, {}
-    daily_by_symbol: dict[str, list[dict]] = {}
-    for group in daily.partition_by("symbol", maintain_order=True):
-        rows = group.to_dicts()
-        for row in rows:
-            row["prev_close"] = row.get("prev_raw_close")
-            previous = _finite(row.get("prev_raw_close"))
-            row["limit_up_price"] = _limit_price(
-                previous,
-                str(row.get("symbol") or group["symbol"][0]),
-                row["date"],
-                str(row.get("name") or ""),
-            ) if previous > 0 else None
-        daily_by_symbol[str(group["symbol"][0])] = rows
-    minute = repo.get_minute_by_dates(symbols, trading_days, asset_type="stock") if symbols else pl.DataFrame()
-    minute_by_symbol_date: dict[tuple[str, date], list[dict]] = {}
-    if not minute.is_empty():
-        aggregations = [
-            pl.col("open").first().alias("open"),
-            pl.col("high").max().alias("high"),
-            pl.col("low").min().alias("low"),
-            pl.col("close").last().alias("close"),
-        ]
-        for column in ("volume", "amount"):
-            if column in minute.columns:
-                aggregations.append(pl.col(column).sum().alias(column))
-        minute = (
-            minute.sort(["symbol", "datetime"])
-            .with_columns([
-                pl.col("datetime").dt.date().alias("date"),
-                pl.col("datetime")
-                .dt.offset_by("-1m")
-                .dt.truncate("5m")
-                .dt.offset_by("5m")
-                .alias("bucket"),
-            ])
-            .group_by(["symbol", "date", "bucket"], maintain_order=True)
-            .agg(aggregations)
-            .rename({"bucket": "datetime"})
-            .sort(["symbol", "date", "datetime"])
-        )
-        for group in minute.partition_by(["symbol", "date"], maintain_order=True):
-            minute_by_symbol_date[(str(group["symbol"][0]), group["date"][0])] = group.to_dicts()
-    return trading_days, daily_by_symbol, minute_by_symbol_date

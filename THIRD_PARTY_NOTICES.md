@@ -2,7 +2,7 @@
 
 ## dragon-quant
 
-Portions of the dragon leader scoring and account simulation logic are adapted from `gitBingxu/dragon-quant` version 0.5.1.
+Portions of the dragon leader scoring logic are adapted from `gitBingxu/dragon-quant` version 0.5.1.
 
 MIT License
 

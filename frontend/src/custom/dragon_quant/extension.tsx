@@ -1,21 +1,14 @@
-import { useEffect, useMemo, useState } from 'react'
+import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Crown, Database, Play, RefreshCw, Trash2 } from 'lucide-react'
+import { ChevronDown, ChevronRight, Copy, Crown, Database, Play, RefreshCw, Trash2 } from 'lucide-react'
 
 import { DatePicker } from '@/components/DatePicker'
 import { PageHeader } from '@/components/PageHeader'
+import { StockPreviewDialog } from '@/components/StockPreviewDialog'
 import type { FrontendExtension } from '@/extensions/types'
-import {
-  api,
-  type DragonBacktestDetail,
-  type DragonBacktestRequest,
-  type DragonEquityPoint,
-  type DragonScanDetail,
-  type DragonScanRequest,
-} from '@/lib/api'
+import { api, type DragonScanDetail, type DragonScanRequest, type DragonScanRow } from '@/lib/api'
+import { toNavItems } from '@/lib/listNav'
 import { QK } from '@/lib/queryKeys'
-
-type Tab = 'scan' | 'backtest'
 
 const QUALITY_LABELS: Record<string, string> = {
   candidate_minute: '候选股分钟线缺失',
@@ -26,6 +19,17 @@ const QUALITY_LABELS: Record<string, string> = {
   absorption_minute_history: '资金承接分钟历史缺失，按中性值估算',
   candidate_absorption_history: '部分候选行业承接历史不足，按中性值估算',
 }
+
+const SCAN_DEFAULTS: DragonScanRequest = {
+  as_of: '',
+  top_industries: 5,
+  lagging_industries: 20,
+  industry_level: 2,
+  result_limit: 25,
+  absorption_days: 10,
+}
+
+const WEIGHT_TEXT = '带动 30% · 领涨 25% · 抗跌 15% · 流动 20% · 承接 10%'
 
 function qualityLabels(values: string[]) {
   return values.map(value => QUALITY_LABELS[value] ?? value).join('、')
@@ -40,6 +44,31 @@ function localDate(offsetDays = 0) {
   return `${year}-${month}-${day}`
 }
 
+function fmtLots(value?: number | null) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  return value.toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+}
+
+function fmtAmount(value?: number | null) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  if (Math.abs(value) >= 1e8) return `${(value / 1e8).toFixed(2)} 亿`
+  if (Math.abs(value) >= 1e4) return `${(value / 1e4).toFixed(2)} 万`
+  return value.toFixed(0)
+}
+
+function fmtScore(value?: number | null, digits = 1) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '—'
+  const text = value.toFixed(digits)
+  return text.includes('.') ? text.replace(/\.?0+$/, '') : text
+}
+
+function shortDay(day: string) {
+  const parts = day.split('-')
+  if (parts.length !== 3) return day
+  return `${Number(parts[1])}月${Number(parts[2])}日`
+}
+
+/** 数字输入: 允许清空重输, 越界值在失焦时收敛到边界, 空值回退到上一个有效值。 */
 function NumberField({
   label,
   value,
@@ -47,6 +76,7 @@ function NumberField({
   min,
   max,
   step = 1,
+  hint,
 }: {
   label: string
   value: number
@@ -54,19 +84,67 @@ function NumberField({
   min?: number
   max?: number
   step?: number
+  hint?: string
 }) {
+  const [text, setText] = useState(() => String(value))
+  const [focused, setFocused] = useState(false)
+
+  useEffect(() => {
+    if (!focused) setText(String(value))
+  }, [value, focused])
+
+  const clamp = (input: number) => {
+    let next = input
+    if (min !== undefined) next = Math.max(min, next)
+    if (max !== undefined) next = Math.min(max, next)
+    return next
+  }
+
+  const handleText = (raw: string) => {
+    setText(raw)
+    if (raw.trim() === '') return
+    const parsed = Number(raw)
+    if (!Number.isFinite(parsed)) return
+    // 输入中途越界不立即写入上层, 避免半截数字被夹到边界后光标/值来回跳
+    if (min !== undefined && parsed < min) return
+    if (max !== undefined && parsed > max) return
+    onChange(parsed)
+  }
+
+  const commit = () => {
+    setFocused(false)
+    const parsed = Number(text)
+    if (text.trim() === '' || !Number.isFinite(parsed)) {
+      setText(String(value))
+      return
+    }
+    const next = clamp(parsed)
+    setText(String(next))
+    if (next !== value) onChange(next)
+  }
+
   return (
     <label className="flex flex-col gap-1 text-xs text-muted">
       <span>{label}</span>
       <input
         type="number"
-        value={value}
+        inputMode="numeric"
+        value={text}
         min={min}
         max={max}
         step={step}
-        onChange={event => onChange(Number(event.target.value))}
+        onFocus={event => {
+          setFocused(true)
+          event.currentTarget.select()
+        }}
+        onChange={event => handleText(event.target.value)}
+        onBlur={commit}
+        onKeyDown={event => {
+          if (event.key === 'Enter') event.currentTarget.blur()
+        }}
         className="h-8 w-full rounded-input border border-border bg-elevated px-2 text-xs text-foreground outline-none focus:border-accent/60"
       />
+      {hint ? <span className="text-[10px] leading-tight text-muted/80">{hint}</span> : null}
     </label>
   )
 }
@@ -120,17 +198,127 @@ function QualityBanner({ detail }: { detail: DragonScanDetail }) {
   )
 }
 
+const DIM_CN: Record<string, string> = {
+  drive: '带动性',
+  leadership: '领涨性',
+  anti_drop: '抗跌性',
+  liquidity: '流动性',
+  absorption: '资金承接',
+}
+
+function translateReject(reason: string) {
+  return reason
+    .replace(/\b(drive|leadership|anti_drop|liquidity|absorption)=/g, (_match, key: string) => `${DIM_CN[key] ?? key} `)
+    .replace('关键数据不完整:', '关键数据不完整：')
+}
+
+function antiDropLegText(leg: { score: number; dip_segments?: number; hold_score?: number; rebound_score?: number; no_dip?: boolean; degraded?: boolean }, label: string) {
+  if (leg.degraded) return `${label}分钟线缺失，按中性 65 分`
+  if (leg.no_dip) return `${label}无有效跳水段，按中性 65 分`
+  return `${label}跳水 ${leg.dip_segments ?? 0} 段：抗跌 ${fmtScore(leg.hold_score)} / 反弹 ${fmtScore(leg.rebound_score)}`
+}
+
+/** 把一行评分还原成「结论 + 逐维度证据」的说明文本 (与页面明细同一来源)。 */
+function buildNarrative(row: DragonScanRow) {
+  const drive = row.dimensions.drive
+  const leadership = row.dimensions.leadership
+  const antiDrop = row.dimensions.anti_drop
+  const liquidity = row.dimensions.liquidity
+  const absorption = row.dimensions.absorption
+  const early = drive.details.early
+  const lead = drive.details.lead
+  const voice = drive.details.voice
+
+  const earlyText = early.sealed
+    ? `${early.seal_time ?? '—'}封板，封单量${fmtLots(early.sealed_volume_lots)}手，涨停池第${early.rank ?? '—'}/${early.pool_size ?? '—'}`
+    : `当日未触及涨停价，涨停池已封${early.pool_size ?? 0}只`
+  const leadText = lead.degraded
+    ? `${lead.reason ?? '个股或行业分钟线缺失'}，按降级中值 40 分`
+    : `带动${lead.n_lead ?? 0}次，被带${lead.n_follow ?? 0}次`
+  const voiceText = voice.degraded
+    ? '行业成分股快照缺失，无法评估'
+    : `涨停${voice.limit_up_count ?? 0}只/强势${voice.strong_count ?? 0}只（成分${voice.member_count ?? 0}只）`
+
+  const sealText = liquidity.details.seal_strength === null || liquidity.details.seal_strength === undefined
+    ? '无五档封单，按中性 60 分'
+    : `强度${fmtScore(liquidity.details.seal_strength, 2)}`
+  const openText = liquidity.details.open_count === null || liquidity.details.open_count === undefined
+    ? '开板次数未知'
+    : `开板${liquidity.details.open_count}次`
+
+  const absorptionEvents = absorption.details.top_events ?? []
+  const absorptionText = absorption.details.fallback
+    ? '回看期内没有符合条件的承接窗口（目标行业拉升 + 同期≥2个板块回落），按中性 50 分'
+    : `${absorption.details.event_count ?? 0}个窗口合并为${absorption.details.merged_event_count ?? absorption.details.event_count ?? 0}次独立承接，最优窗口${fmtScore(absorption.details.best_event_score)}分（维度分 = 最优 + 窗口数奖励，上限 100）`
+
+  const lines = [
+    `🐉 带动性(${fmtScore(drive.score)}): 封板最早${fmtScore(early.score)}：${earlyText}；带动板块${fmtScore(lead.score)}：${leadText}；板块共鸣${fmtScore(voice.score)}：${voiceText}`,
+    `📊 领涨性(${fmtScore(leadership.score)}): 连板${fmtScore(leadership.details.board_score)}(本${leadership.details.board_count}板/行业最高${leadership.details.industry_max_boards}板)/涨幅${fmtScore(leadership.details.five_day_rank_score)}(5日${leadership.details.five_day_return_pct}%,排名${leadership.details.five_day_rank ?? '—'}/${leadership.details.five_day_peer_count ?? '—'})`,
+    `🛡️ 抗跌性(${fmtScore(antiDrop.score)}): 大盘维度${fmtScore(antiDrop.details.market.score)}：${antiDropLegText(antiDrop.details.market, '大盘')}；板块维度${fmtScore(antiDrop.details.industry.score)}：${antiDropLegText(antiDrop.details.industry, row.industry)}`,
+    `💧 流动性(${fmtScore(liquidity.score)}): 换手${fmtScore(liquidity.details.turnover_score)}(${liquidity.details.turnover_rate_pct}%)/封板${fmtScore(liquidity.details.seal_score)}(${sealText},${openText})`,
+    `🪙 资金承接(${fmtScore(absorption.score)}): ${absorptionText}`,
+    `📎 基础数据：成交额${fmtAmount(row.amount_yuan)} · 换手率${row.turnover_rate_pct}% · 5日涨幅${row.five_day_return_pct}% · 行业层级命中：${row.industry}`,
+    `⚖️ 加权：${WEIGHT_TEXT} → 综合 ${row.composite_score} 分`,
+  ]
+
+  for (const event of absorptionEvents) {
+    const falling = event.falling.slice(0, 3).map(item => `${item.industry}${item.change_pct}%`).join('、')
+    lines.push(`　　└ 承接事件：${shortDay(event.day)} ${event.window_start}–${event.window_end} 目标行业+${event.target_return_pct}%，同期${event.falling_count}个板块回落${falling ? `（${falling}）` : ''}`)
+  }
+
+  lines.push(row.is_true_dragon
+    ? `✅ 认证为真龙，真龙排名第${row.rank ?? '—'}（带动/领涨/抗跌/流动四项硬门槛全部达标）`
+    : `❌ 未认证：${row.reject_reason ? translateReject(row.reject_reason) : '未通过硬门槛'}`)
+
+  const title = `${row.name}(${row.symbol})——${row.industry}——${row.board_count}连板-${row.composite_score}分-${row.is_true_dragon ? '✓真龙' : '✗未通过'}`
+  return { title, lines, text: [title, ...lines.map(line => `- ${line}`)].join('\n') }
+}
+
+function RowDetail({ row }: { row: DragonScanRow }) {
+  const narrative = useMemo(() => buildNarrative(row), [row])
+  const [copied, setCopied] = useState(false)
+
+  useEffect(() => {
+    if (!copied) return
+    const timer = window.setTimeout(() => setCopied(false), 1600)
+    return () => window.clearTimeout(timer)
+  }, [copied])
+
+  const copy = () => {
+    const text = narrative.text
+    navigator.clipboard?.writeText(text).then(() => setCopied(true)).catch(() => setCopied(false))
+  }
+
+  return (
+    <div className="rounded-card border border-border bg-surface p-3">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div className="text-xs font-medium text-foreground">{narrative.title}</div>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] text-muted">分数括号＝该维度加权分，子项括号＝子项得分</span>
+          <button
+            type="button"
+            onClick={copy}
+            className="inline-flex h-6 items-center gap-1 rounded-btn border border-border px-2 text-[10px] text-muted hover:border-accent/50 hover:text-accent"
+          >
+            <Copy className="h-3 w-3" />{copied ? '已复制' : '复制说明'}
+          </button>
+        </div>
+      </div>
+      <ul className="mt-2 space-y-1 text-[11px] leading-5 text-secondary">
+        {narrative.lines.map((line, index) => (
+          <li key={index} className="whitespace-pre-wrap break-words">{line}</li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
 function ScanPanel({ disabled = false }: { disabled?: boolean }) {
   const queryClient = useQueryClient()
   const [selectedId, setSelectedId] = useState('')
-  const [form, setForm] = useState<DragonScanRequest>({
-    as_of: localDate(),
-    top_industries: 5,
-    lagging_industries: 20,
-    industry_level: 2,
-    result_limit: 25,
-    absorption_days: 10,
-  })
+  const [expanded, setExpanded] = useState<string | null>(null)
+  const [preview, setPreview] = useState<{ symbol: string; name: string } | null>(null)
+  const [form, setForm] = useState<DragonScanRequest>(() => ({ ...SCAN_DEFAULTS, as_of: localDate() }))
   const list = useQuery({ queryKey: QK.dragonQuantScans, queryFn: api.dragonQuantScans })
   useEffect(() => {
     if (!selectedId && list.data?.[0]) setSelectedId(list.data[0].id)
@@ -147,6 +335,7 @@ function ScanPanel({ disabled = false }: { disabled?: boolean }) {
       queryClient.invalidateQueries({ queryKey: QK.dragonQuantScans })
       queryClient.invalidateQueries({ queryKey: QK.dragonQuantStatus })
       setSelectedId(value.id)
+      setExpanded(null)
     },
   })
   const remove = useMutation({
@@ -155,25 +344,39 @@ function ScanPanel({ disabled = false }: { disabled?: boolean }) {
       queryClient.invalidateQueries({ queryKey: QK.dragonQuantScans })
       queryClient.invalidateQueries({ queryKey: QK.dragonQuantStatus })
       setSelectedId('')
+      setExpanded(null)
     },
   })
+
+  const rows = useMemo(() => detail.data?.rows ?? [], [detail.data])
+  const navList = useMemo(() => toNavItems(rows), [rows])
+  const toggle = useCallback((symbol: string) => {
+    setExpanded(current => (current === symbol ? null : symbol))
+  }, [])
 
   return (
     <div className="grid gap-4 xl:grid-cols-[300px_minmax(0,1fr)]">
       <aside className="space-y-3">
         <div className="rounded-card border border-border bg-surface p-3">
-          <div className="mb-3 text-sm font-medium">运行五维扫描</div>
+          <div className="mb-3 flex items-center justify-between">
+            <div className="text-sm font-medium">运行五维扫描</div>
+            <button
+              type="button"
+              onClick={() => setForm({ ...SCAN_DEFAULTS, as_of: localDate() })}
+              className="text-[10px] text-muted hover:text-accent"
+            >恢复默认</button>
+          </div>
           <div className="space-y-3">
             <label className="flex flex-col gap-1 text-xs text-muted">
               <span>交易日期</span>
               <DatePicker value={form.as_of} max={localDate()} onChange={as_of => setForm(current => ({ ...current, as_of }))} align="left" />
             </label>
             <div className="grid grid-cols-2 gap-2">
-              <NumberField label="领涨行业" value={form.top_industries} min={1} max={20} onChange={top_industries => setForm(current => ({ ...current, top_industries }))} />
-              <NumberField label="领跌行业" value={form.lagging_industries} min={2} max={50} onChange={lagging_industries => setForm(current => ({ ...current, lagging_industries }))} />
-              <NumberField label="行业层级" value={form.industry_level} min={1} max={5} onChange={industry_level => setForm(current => ({ ...current, industry_level }))} />
-              <NumberField label="返回数量" value={form.result_limit} min={1} max={100} onChange={result_limit => setForm(current => ({ ...current, result_limit }))} />
-              <NumberField label="承接回看日" value={form.absorption_days} min={3} max={30} onChange={absorption_days => setForm(current => ({ ...current, absorption_days }))} />
+              <NumberField label="领涨行业" value={form.top_industries} min={1} max={20} onChange={top_industries => setForm(current => ({ ...current, top_industries }))} hint="按行业涨幅取前 N" />
+              <NumberField label="领跌行业" value={form.lagging_industries} min={2} max={50} onChange={lagging_industries => setForm(current => ({ ...current, lagging_industries }))} hint="承接对照样本" />
+              <NumberField label="行业层级" value={form.industry_level} min={1} max={5} onChange={industry_level => setForm(current => ({ ...current, industry_level }))} hint="1 一级 / 2 二级" />
+              <NumberField label="返回数量" value={form.result_limit} min={1} max={100} onChange={result_limit => setForm(current => ({ ...current, result_limit }))} hint="候选行上限" />
+              <NumberField label="承接回看日" value={form.absorption_days} min={3} max={30} onChange={absorption_days => setForm(current => ({ ...current, absorption_days }))} hint="承接历史交易日" />
             </div>
             <button
               type="button"
@@ -185,6 +388,7 @@ function ScanPanel({ disabled = false }: { disabled?: boolean }) {
               {run.isPending ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}
               {run.isPending ? '扫描中' : '运行扫描'}
             </button>
+            {run.isError ? <div className="text-[11px] text-danger">扫描失败：{(run.error as Error).message}</div> : null}
           </div>
         </div>
         <div className="rounded-card border border-border bg-surface p-3">
@@ -197,7 +401,7 @@ function ScanPanel({ disabled = false }: { disabled?: boolean }) {
                 <button
                   key={item.id}
                   type="button"
-                  onClick={() => setSelectedId(item.id)}
+                  onClick={() => { setSelectedId(item.id); setExpanded(null) }}
                   className={`flex w-full items-center justify-between rounded-btn px-2 py-2 text-left text-xs ${selectedId === item.id ? 'bg-accent/15 text-accent' : 'hover:bg-elevated'}`}
                 >
                   <span>{item.as_of}</span>
@@ -219,6 +423,7 @@ function ScanPanel({ disabled = false }: { disabled?: boolean }) {
                 <div className="text-base font-medium">{detail.data.as_of} 龙头候选</div>
                 <div className="text-xs text-muted">
                   候选 {detail.data.summary.candidate_count} · 评分过线 {detail.data.summary.score_passed_count} · 真龙 {detail.data.summary.true_dragon_count}
+                  <span className="ml-2 text-muted/80">点击行展开证据明细，点击股票名打开日K</span>
                 </div>
               </div>
               <button
@@ -231,32 +436,60 @@ function ScanPanel({ disabled = false }: { disabled?: boolean }) {
               </button>
             </div>
             <QualityBanner detail={detail.data} />
-            {!detail.data.rows.length ? <EmptyState>当日领涨行业内没有符合口径的涨停候选</EmptyState> : (
+            {!rows.length ? <EmptyState>当日领涨行业内没有符合口径的涨停候选</EmptyState> : (
               <div className="overflow-auto rounded-card border border-border bg-surface">
-                <table className="w-full min-w-[980px] text-xs">
+                <table className="w-full min-w-[1040px] text-xs">
                   <thead className="bg-elevated text-muted">
                     <tr>
-                      {['排名', '股票', '行业', '连板', '综合分', '带动', '领涨', '抗跌', '流动', '承接', '结论'].map(label => (
-                        <th key={label} className="px-3 py-2 text-left font-medium">{label}</th>
+                      {['排名', '股票', '行业', '连板', '综合分', '带动', '领涨', '抗跌', '流动', '承接', '结论', ''].map((label, index) => (
+                        <th key={`${label}-${index}`} className="px-3 py-2 text-left font-medium">{label}</th>
                       ))}
                     </tr>
                   </thead>
                   <tbody>
-                    {detail.data.rows.map(row => (
-                      <tr key={row.symbol} className="border-t border-border/70 hover:bg-elevated/40">
-                        <td className="px-3 py-2 num">{row.rank ?? '—'}</td>
-                        <td className="px-3 py-2"><div className="font-medium">{row.name}</div><div className="text-muted num">{row.symbol}</div></td>
-                        <td className="px-3 py-2">{row.industry}</td>
-                        <td className="px-3 py-2 num">{row.board_count}</td>
-                        <td className="px-3 py-2 font-medium num">{row.composite_score.toFixed(2)}</td>
-                        {(['drive', 'leadership', 'anti_drop', 'liquidity', 'absorption'] as const).map(key => (
-                          <td key={key} className="px-3 py-2 num">{row.dimensions[key].score.toFixed(1)}</td>
-                        ))}
-                        <td className="max-w-64 px-3 py-2">
-                          {row.is_true_dragon ? <span className="text-accent">真龙</span> : <span className="text-danger">{row.reject_reason || '未通过'}</span>}
-                        </td>
-                      </tr>
-                    ))}
+                    {rows.map(row => {
+                      const isOpen = expanded === row.symbol
+                      return (
+                        <Fragment key={row.symbol}>
+                          <tr
+                            onClick={() => toggle(row.symbol)}
+                            className={`cursor-pointer border-t border-border/70 ${isOpen ? 'bg-elevated/60' : 'hover:bg-elevated/40'}`}
+                          >
+                            <td className="px-3 py-2 num">{row.rank ?? '—'}</td>
+                            <td className="px-3 py-2">
+                              <button
+                                type="button"
+                                onClick={event => { event.stopPropagation(); setPreview({ symbol: row.symbol, name: row.name }) }}
+                                className="text-left font-medium text-foreground underline-offset-2 hover:text-accent hover:underline"
+                                title="查看日K"
+                              >
+                                {row.name}
+                              </button>
+                              <div className="text-muted num">{row.symbol}</div>
+                            </td>
+                            <td className="px-3 py-2">{row.industry}</td>
+                            <td className="px-3 py-2 num">{row.board_count}</td>
+                            <td className="px-3 py-2 font-medium num">{row.composite_score.toFixed(2)}</td>
+                            {(['drive', 'leadership', 'anti_drop', 'liquidity', 'absorption'] as const).map(key => (
+                              <td key={key} className="px-3 py-2 num">{row.dimensions[key].score.toFixed(1)}</td>
+                            ))}
+                            <td className="max-w-64 px-3 py-2">
+                              {row.is_true_dragon ? <span className="text-accent">真龙</span> : <span className="text-danger">{translateReject(row.reject_reason || '未通过')}</span>}
+                            </td>
+                            <td className="px-2 py-2 text-muted">
+                              {isOpen ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
+                            </td>
+                          </tr>
+                          {isOpen ? (
+                            <tr className="border-t border-border/70 bg-elevated/30">
+                              <td colSpan={12} className="px-3 pb-3 pt-2">
+                                <RowDetail row={row} />
+                              </td>
+                            </tr>
+                          ) : null}
+                        </Fragment>
+                      )
+                    })}
                   </tbody>
                 </table>
               </div>
@@ -264,194 +497,35 @@ function ScanPanel({ disabled = false }: { disabled?: boolean }) {
           </>
         )}
       </section>
-    </div>
-  )
-}
 
-function EquityChart({ points }: { points: DragonEquityPoint[] }) {
-  const polyline = useMemo(() => {
-    if (!points.length) return ''
-    const values = points.map(point => point.equity)
-    const low = Math.min(...values)
-    const high = Math.max(...values)
-    const span = Math.max(high - low, 1)
-    return points.map((point, index) => {
-      const x = points.length === 1 ? 0 : index / (points.length - 1) * 100
-      const y = 94 - (point.equity - low) / span * 88
-      return `${x},${y}`
-    }).join(' ')
-  }, [points])
-  if (!points.length) return <EmptyState>暂无权益曲线</EmptyState>
-  return (
-    <div className="h-56 rounded-card border border-border bg-surface p-3">
-      <div className="mb-2 text-sm font-medium">账户权益曲线</div>
-      <svg viewBox="0 0 100 100" preserveAspectRatio="none" className="h-[180px] w-full overflow-visible">
-        <line x1="0" y1="94" x2="100" y2="94" stroke="currentColor" className="text-border" strokeWidth="0.5" />
-        <polyline points={polyline} fill="none" stroke="currentColor" className="text-accent" strokeWidth="1.6" vectorEffect="non-scaling-stroke" />
-      </svg>
-    </div>
-  )
-}
-
-function BacktestResult({ value }: { value: DragonBacktestDetail }) {
-  const stats = value.stats
-  return (
-    <div className="space-y-3">
-      {value.warnings.map(warning => (
-        <div key={warning} className="rounded-card border border-warning/30 bg-warning/5 px-3 py-2 text-xs text-warning">{warning}</div>
-      ))}
-      <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-4">
-        {[
-          ['总收益', `${stats.total_return_pct.toFixed(2)}%`],
-          ['最大回撤', `${stats.max_drawdown_pct.toFixed(2)}%`],
-          ['最终权益', stats.final_equity.toLocaleString('zh-CN', { maximumFractionDigits: 2 })],
-          ['交易笔数', String(stats.trade_count)],
-        ].map(([label, valueText]) => (
-          <div key={label} className="rounded-card border border-border bg-surface p-3">
-            <div className="text-xs text-muted">{label}</div>
-            <div className="mt-1 text-lg font-semibold num">{valueText}</div>
-          </div>
-        ))}
-      </div>
-      <EquityChart points={value.equity_curve} />
-      <div className="overflow-auto rounded-card border border-border bg-surface">
-        <div className="border-b border-border px-3 py-2 text-sm font-medium">交割记录</div>
-        {!value.trades.length ? <div className="p-6 text-center text-xs text-muted">区间内没有触发交易</div> : (
-          <table className="w-full min-w-[850px] text-xs">
-            <thead className="bg-elevated text-muted"><tr>{['日期', '股票', '方向', '价格', '数量', '费用', '原因'].map(label => <th key={label} className="px-3 py-2 text-left font-medium">{label}</th>)}</tr></thead>
-            <tbody>{value.trades.map((trade, index) => (
-              <tr key={`${trade.trade_date}-${trade.symbol}-${index}`} className="border-t border-border/70">
-                <td className="px-3 py-2 num">{trade.trade_date}</td>
-                <td className="px-3 py-2">{trade.name}<span className="ml-1 text-muted num">{trade.symbol}</span></td>
-                <td className={`px-3 py-2 ${trade.side === 'buy' ? 'text-bull' : 'text-bear'}`}>{trade.side === 'buy' ? '买入' : '卖出'}</td>
-                <td className="px-3 py-2 num">{trade.price.toFixed(3)}</td>
-                <td className="px-3 py-2 num">{trade.quantity}</td>
-                <td className="px-3 py-2 num">{trade.fee.toFixed(2)}</td>
-                <td className="px-3 py-2">{trade.reason_text}</td>
-              </tr>
-            ))}</tbody>
-          </table>
-        )}
-      </div>
-    </div>
-  )
-}
-
-function BacktestPanel() {
-  const queryClient = useQueryClient()
-  const [selectedId, setSelectedId] = useState('')
-  const [form, setForm] = useState<DragonBacktestRequest>({
-    start: localDate(-90),
-    end: localDate(),
-    initial_cash: 100_000,
-    candidate_top_n: 5,
-    candidate_lookback_days: 3,
-    max_positions: 5,
-    min_score: 50,
-    min_amount: 200_000_000,
-    min_turnover: 5,
-    first_day_stop_loss_pct: -3.5,
-    stop_loss_pct: -5,
-    breakeven_activate_pct: 6,
-    trailing_activate_pct: 8,
-    trailing_drawdown_pct: 3.5,
-    auto_scan_missing: false,
-  })
-  const list = useQuery({ queryKey: QK.dragonQuantBacktests, queryFn: api.dragonQuantBacktests })
-  useEffect(() => {
-    if (!selectedId && list.data?.[0]) setSelectedId(list.data[0].id)
-  }, [list.data, selectedId])
-  const detail = useQuery({
-    queryKey: QK.dragonQuantBacktest(selectedId),
-    queryFn: () => api.dragonQuantBacktest(selectedId),
-    enabled: Boolean(selectedId),
-  })
-  const run = useMutation({
-    mutationFn: api.dragonQuantRunBacktest,
-    onSuccess: value => {
-      queryClient.setQueryData(QK.dragonQuantBacktest(value.id), value)
-      queryClient.invalidateQueries({ queryKey: QK.dragonQuantBacktests })
-      queryClient.invalidateQueries({ queryKey: QK.dragonQuantScans })
-      queryClient.invalidateQueries({ queryKey: QK.dragonQuantStatus })
-      setSelectedId(value.id)
-    },
-  })
-  const remove = useMutation({
-    mutationFn: api.dragonQuantDeleteBacktest,
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: QK.dragonQuantBacktests })
-      queryClient.invalidateQueries({ queryKey: QK.dragonQuantStatus })
-      setSelectedId('')
-    },
-  })
-
-  return (
-    <div className="space-y-4">
-      <div className="rounded-card border border-border bg-surface p-3">
-        <div className="grid gap-3 md:grid-cols-3 xl:grid-cols-6">
-          <label className="flex flex-col gap-1 text-xs text-muted"><span>开始日期</span><DatePicker value={form.start} max={form.end} onChange={start => setForm(current => ({ ...current, start }))} align="left" /></label>
-          <label className="flex flex-col gap-1 text-xs text-muted"><span>结束日期</span><DatePicker value={form.end} min={form.start} max={localDate()} onChange={end => setForm(current => ({ ...current, end }))} align="left" /></label>
-          <NumberField label="初始资金" value={form.initial_cash} min={10_000} step={10_000} onChange={initial_cash => setForm(current => ({ ...current, initial_cash }))} />
-          <NumberField label="最大持仓" value={form.max_positions} min={1} max={20} onChange={max_positions => setForm(current => ({ ...current, max_positions }))} />
-          <NumberField label="候选数量" value={form.candidate_top_n} min={1} max={20} onChange={candidate_top_n => setForm(current => ({ ...current, candidate_top_n }))} />
-          <NumberField label="候选回看日" value={form.candidate_lookback_days} min={1} max={10} onChange={candidate_lookback_days => setForm(current => ({ ...current, candidate_lookback_days }))} />
-          <NumberField label="最低综合分" value={form.min_score} min={0} max={100} onChange={min_score => setForm(current => ({ ...current, min_score }))} />
-          <NumberField label="最低成交额" value={form.min_amount} min={0} step={10_000_000} onChange={min_amount => setForm(current => ({ ...current, min_amount }))} />
-          <NumberField label="最低换手率 %" value={form.min_turnover} min={0} step={0.5} onChange={min_turnover => setForm(current => ({ ...current, min_turnover }))} />
-          <NumberField label="首日止损 %" value={form.first_day_stop_loss_pct} min={-30} max={0} step={0.5} onChange={first_day_stop_loss_pct => setForm(current => ({ ...current, first_day_stop_loss_pct }))} />
-          <NumberField label="后续止损 %" value={form.stop_loss_pct} min={-30} max={0} step={0.5} onChange={stop_loss_pct => setForm(current => ({ ...current, stop_loss_pct }))} />
-          <NumberField label="保本激活 %" value={form.breakeven_activate_pct} min={0} max={50} step={0.5} onChange={breakeven_activate_pct => setForm(current => ({ ...current, breakeven_activate_pct }))} />
-          <NumberField label="移动止盈激活 %" value={form.trailing_activate_pct} min={0} max={100} step={0.5} onChange={trailing_activate_pct => setForm(current => ({ ...current, trailing_activate_pct }))} />
-          <NumberField label="移动止盈回撤 %" value={form.trailing_drawdown_pct} min={0} max={50} step={0.5} onChange={trailing_drawdown_pct => setForm(current => ({ ...current, trailing_drawdown_pct }))} />
-        </div>
-        <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
-          <label className="inline-flex items-center gap-2 text-xs text-muted">
-            <input type="checkbox" checked={form.auto_scan_missing} onChange={event => setForm(current => ({ ...current, auto_scan_missing: event.target.checked }))} />
-            自动补齐缺失扫描（最多 20 个交易日）
-          </label>
-          <button type="button" disabled={run.isPending || !form.start || !form.end} onClick={() => run.mutate(form)} className="inline-flex h-8 items-center gap-2 rounded-btn bg-accent px-4 text-xs font-medium text-white disabled:opacity-50">
-            {run.isPending ? <RefreshCw className="h-3.5 w-3.5 animate-spin" /> : <Play className="h-3.5 w-3.5" />}{run.isPending ? '回测中' : '运行账户回测'}
-          </button>
-        </div>
-      </div>
-
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <select value={selectedId} onChange={event => setSelectedId(event.target.value)} className="h-8 min-w-64 rounded-input border border-border bg-elevated px-2 text-xs">
-          <option value="">选择历史回测</option>
-          {list.data?.map(item => <option key={item.id} value={item.id}>{item.start} 至 {item.end} · {item.stats.total_return_pct.toFixed(2)}%</option>)}
-        </select>
-        {detail.data && <button type="button" disabled={remove.isPending} onClick={() => window.confirm('确认删除这条回测记录？') && remove.mutate(detail.data.id)} className="inline-flex h-8 items-center gap-1 rounded-btn border border-border px-2.5 text-xs text-muted hover:border-danger/50 hover:text-danger"><Trash2 className="h-3.5 w-3.5" />删除</button>}
-      </div>
-      {detail.isLoading ? <EmptyState>正在加载回测结果...</EmptyState> : detail.isError ? <EmptyState>回测记录加载失败</EmptyState> : detail.data ? <BacktestResult value={detail.data} /> : <EmptyState>选择或运行一次账户回测</EmptyState>}
+      {preview ? (
+        <StockPreviewDialog
+          symbol={preview.symbol}
+          name={preview.name}
+          navList={navList}
+          onClose={() => setPreview(null)}
+          onNavigate={(symbol, name) => setPreview({ symbol, name: name ?? '' })}
+        />
+      ) : null}
     </div>
   )
 }
 
 function DragonQuantPage() {
-  const [tab, setTab] = useState<Tab>('scan')
   const status = useQuery({ queryKey: QK.dragonQuantStatus, queryFn: api.dragonQuantStatus })
   return (
     <div className="flex h-full min-h-0 flex-col">
       <PageHeader
         title="龙头策略"
-        subtitle="dragon-quant 五维识别与账户级回测"
+        subtitle="dragon-quant 五维真龙识别与逐票证据明细"
         titleExtra={status.data && <span className={`rounded-full px-2 py-0.5 text-[10px] ${status.data.status === 'ready' ? 'bg-accent/10 text-accent' : 'bg-warning/10 text-warning'}`}>{status.data.status === 'ready' ? '数据源已就绪' : '缺行业数据'}</span>}
         right={<div className="hidden items-center gap-1 text-xs text-muted md:flex"><Database className="h-3.5 w-3.5" />仅使用 tick-stock-panel 数据源</div>}
       />
-      <div className="border-b border-border px-5">
-        <div className="flex gap-1">
-          {([['scan', '五维选股'], ['backtest', '龙头账户回测']] as const).map(([id, label]) => (
-            <button key={id} type="button" onClick={() => setTab(id)} className={`border-b-2 px-3 py-2 text-sm ${tab === id ? 'border-accent text-accent' : 'border-transparent text-muted hover:text-foreground'}`}>{label}</button>
-          ))}
-        </div>
-      </div>
       <main className="min-h-0 flex-1 overflow-auto p-5">
         {status.isError ? <div className="mb-3 rounded-card border border-danger/30 bg-danger/5 px-3 py-2 text-xs text-danger">扩展状态读取失败，请检查后端扩展是否已加载。</div> : status.data?.status === 'needs_industry_data' ? <div className="mb-3 rounded-card border border-warning/30 bg-warning/5 px-3 py-2 text-xs text-warning">未发现行业扩展数据，请先在“数据管理 / 行业分析”完成行业映射同步。</div> : null}
-        {tab === 'scan' ? (
-          <ScanPanel disabled={status.isLoading || status.data?.status !== 'ready'} />
-        ) : <BacktestPanel />}
+        <ScanPanel disabled={status.isLoading || status.data?.status !== 'ready'} />
         <div className="mt-4 rounded-card border border-border bg-surface px-3 py-2 text-[11px] leading-5 text-muted">
-          策略算法移植自 gitBingxu/dragon-quant 0.5.1（MIT）。未接入雪球、同花顺或腾讯直连；候选与有限行业样本分钟线按需读取，市场基准使用上证指数。关键分钟数据缺失时 fail-closed，五档盘口和资金承接历史缺失时按源策略中性降级；账户回测严格使用历史扫描、T+1、费用和滑点，不使用事后最低价买入。
+          策略算法移植自 gitBingxu/dragon-quant 0.5.1（MIT）。未接入雪球、同花顺或腾讯直连；候选与有限行业样本分钟线按需读取，市场基准使用上证指数。关键分钟数据缺失时 fail-closed，五档盘口和资金承接历史缺失时按源策略中性降级。资金承接为本地简化实现：维度分取「最优窗口分 + 窗口数奖励」，明细里标注实际使用的窗口数与代表事件。
         </div>
       </main>
     </div>
@@ -466,4 +540,3 @@ const extension: FrontendExtension = {
 }
 
 export default extension
-

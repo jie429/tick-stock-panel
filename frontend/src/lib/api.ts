@@ -2177,14 +2177,81 @@ export interface DragonQuantStatus {
   latest_enriched_date: string | null
   depth_service_available: boolean
   scan_count: number
-  backtest_count: number
   adaptations: string[]
 }
 
-export interface DragonDimension {
+export interface DragonDimension<TDetails = Record<string, unknown>> {
   score: number
   weight: number
-  details: Record<string, unknown>
+  details: TDetails
+}
+
+/** 带动性子项: 封板最早 / 带动板块 / 板块共鸣 */
+export interface DragonDriveDetails {
+  early: { score: number; sealed: boolean; seal_time?: string; rank?: number; pool_size?: number; sealed_volume_lots?: number | null }
+  lead: { score: number; n_lead?: number; n_follow?: number; degraded?: boolean; reason?: string }
+  voice: { score: number; member_count?: number; limit_up_count?: number; strong_count?: number; limit_ratio?: number; strong_ratio?: number; degraded?: boolean }
+}
+
+/** 领涨性子项: 连板高度 / 五日涨幅排名 */
+export interface DragonLeadershipDetails {
+  board_count: number
+  industry_max_boards: number
+  board_score: number
+  five_day_return_pct: number
+  five_day_rank_score: number
+  five_day_rank: number
+  five_day_peer_count: number
+}
+
+/** 抗跌性单个基准 (大盘 / 板块) 的明细 */
+export interface DragonAntiDropLeg {
+  score: number
+  dip_segments?: number
+  hold_score?: number
+  rebound_score?: number
+  no_dip?: boolean
+  degraded?: boolean
+}
+
+export interface DragonAntiDropDetails {
+  market: DragonAntiDropLeg
+  industry: DragonAntiDropLeg
+}
+
+/** 流动性子项: 换手 / 封板强度 / 开板次数 */
+export interface DragonLiquidityDetails {
+  turnover_rate_pct: number
+  sealed_volume_lots: number | null
+  volume_lots: number
+  seal_strength: number | null
+  open_count: number | null
+  degraded: boolean
+  absolute_score: number
+  relative_score: number
+  turnover_score: number
+  strength_score: number
+  stable_score: number
+  seal_score: number
+}
+
+/** 资金承接事件: 目标行业拉升窗口 + 同期回落板块 */
+export interface DragonAbsorptionEvent {
+  day: string
+  window_start: string
+  window_end: string
+  score: number
+  target_return_pct: number
+  falling_count: number
+  falling: Array<{ industry: string; change_pct: number }>
+}
+
+export interface DragonAbsorptionDetails {
+  event_count: number
+  merged_event_count: number
+  best_event_score?: number
+  fallback?: boolean
+  top_events?: DragonAbsorptionEvent[]
 }
 
 export interface DragonScanRow {
@@ -2201,7 +2268,13 @@ export interface DragonScanRow {
   is_true_dragon: boolean
   reject_reason: string | null
   rank: number | null
-  dimensions: Record<'drive' | 'leadership' | 'anti_drop' | 'liquidity' | 'absorption', DragonDimension>
+  dimensions: {
+    drive: DragonDimension<DragonDriveDetails>
+    leadership: DragonDimension<DragonLeadershipDetails>
+    anti_drop: DragonDimension<DragonAntiDropDetails>
+    liquidity: DragonDimension<DragonLiquidityDetails>
+    absorption: DragonDimension<DragonAbsorptionDetails>
+  }
 }
 
 export interface DragonScanSummary {
@@ -2249,72 +2322,6 @@ export interface DragonScanRequest {
   industry_level: number
   result_limit: number
   absorption_days: number
-}
-
-export interface DragonTrade {
-  trade_date: string
-  symbol: string
-  name: string
-  side: 'buy' | 'sell'
-  price: number
-  quantity: number
-  amount: number
-  fee: number
-  reason_code: string
-  reason_text: string
-  candidate_date?: string
-  composite_score?: number
-}
-
-export interface DragonEquityPoint {
-  date: string
-  cash: number
-  market_value: number
-  equity: number
-  return_pct: number
-  drawdown_pct: number
-  positions: number
-}
-
-export interface DragonBacktestSummary {
-  id: string
-  start: string
-  end: string
-  created_at: string
-  warnings: string[]
-  config: Record<string, number | boolean>
-  stats: {
-    initial_cash: number
-    final_equity: number
-    total_return_pct: number
-    max_drawdown_pct: number
-    trade_count: number
-  }
-}
-
-export interface DragonBacktestDetail extends DragonBacktestSummary {
-  trades: DragonTrade[]
-  equity_curve: DragonEquityPoint[]
-  open_positions: Array<Record<string, string | number>>
-  used_scan_ids: string[]
-}
-
-export interface DragonBacktestRequest {
-  start: string
-  end: string
-  initial_cash: number
-  candidate_top_n: number
-  candidate_lookback_days: number
-  max_positions: number
-  min_score: number
-  min_amount: number
-  min_turnover: number
-  first_day_stop_loss_pct: number
-  stop_loss_pct: number
-  breakeven_activate_pct: number
-  trailing_activate_pct: number
-  trailing_drawdown_pct: number
-  auto_scan_missing: boolean
 }
 
 // ===== 板块切换 (盘中轮动, 全量分钟聚合) =====
@@ -2410,20 +2417,6 @@ export const api = {
     }),
   dragonQuantDeleteScan: (id: string) =>
     request<{ ok: boolean }>(`/api/custom/dragon-quant/scans/${encodeURIComponent(id)}`, {
-      method: 'DELETE',
-    }),
-  dragonQuantBacktests: () =>
-    request<DragonBacktestSummary[]>('/api/custom/dragon-quant/backtests'),
-  dragonQuantBacktest: (id: string) =>
-    request<DragonBacktestDetail>(`/api/custom/dragon-quant/backtests/${encodeURIComponent(id)}`),
-  dragonQuantRunBacktest: (payload: DragonBacktestRequest) =>
-    request<DragonBacktestDetail>('/api/custom/dragon-quant/backtests', {
-      method: 'POST',
-      body: JSON.stringify(payload),
-      timeoutMs: COMPUTE_REQUEST_TIMEOUT_MS,
-    }),
-  dragonQuantDeleteBacktest: (id: string) =>
-    request<{ ok: boolean }>(`/api/custom/dragon-quant/backtests/${encodeURIComponent(id)}`, {
       method: 'DELETE',
     }),
 
