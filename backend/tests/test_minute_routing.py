@@ -649,12 +649,17 @@ def test_sync_and_persist_minute_streams_iter_minute(monkeypatch, tmp_path):
     mock_repo.store.data_dir = tmp_path
     mock_repo.db.execute = MagicMock()
 
+    # 上层 (API / 盘后管道) 的回调是 3 参 (cur, total, seg_label): 流式分支必须补上
+    # seg_label 再转发, 否则 _on_chunk 缺参直接抛 TypeError 让整个同步任务失败。
+    progress: list[tuple[int, int, str]] = []
     written = kline_sync.sync_and_persist_minute(
         ["600519.SH", "000001.SZ"], mock_repo,
         CapabilitySet({Cap.KLINE_MINUTE_BATCH: CapabilityLimits()}),
         universe_sync=True,
+        on_chunk_done=lambda cur, total, label: progress.append((cur, total, label)),
     )
 
+    assert progress == [(1, 2, "custom"), (2, 2, "custom")]
     assert write_spy.call_count == 2
     assert [call.args[0]["symbol"][0] for call in write_spy.call_args_list] == [
         "600519.SH", "000001.SZ",

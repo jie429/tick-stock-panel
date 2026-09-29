@@ -1749,7 +1749,7 @@ def sync_and_persist_minute(
     存储口径由基准标记决定 (services/minute_adjust): 存量未迁移 → SDK adjust=qfq
     前复权 (旧行为); 已迁移 → adjust='none' 原始价落盘, 复权读取时投影。
     使用 start_time / end_time 区间拉取, 确保所有标的覆盖同一时间段。
-    on_chunk_done(current, total) 每个 chunk 完成后回调。
+    on_chunk_done(current, total, seg_label) 每个 chunk 完成后回调。
     force_full_days=True 时强制回溯 days 自然日 (不增量补, 用于个股补齐历史)。
     universe_sync=True 仅供全市场入口调用; 按标的/分组请求保持 False。
     自定义分钟源实现可选契约 ``iter_minute`` 时逐批消费并逐批落盘 (与 iter_daily
@@ -1850,11 +1850,20 @@ def sync_and_persist_minute(
         else None
     )
     if callable(iter_minute):
+        # 回调口径适配: 上层是 3 参 (cur, total, seg_label), 而 iter_minute 契约与
+        # _custom_minute_batch 一样只回调 2 参 (cur, total) —— 不补 seg_label 就透传
+        # 会让 API 层 _on_chunk 缺参抛 TypeError, 整个同步任务当场失败。
+        stream_cb: Callable[[int, int], None] | None = None
+        if on_chunk_done is not None:
+            def _stream_cb(cur: int, total: int) -> None:
+                on_chunk_done(cur, total, "custom")
+
+            stream_cb = _stream_cb
         try:
             for chunk_df in iter_minute(
                 symbols, start_time=start_time, end_time=end_time,
                 asset_type=asset_type, freq="1m",
-                on_chunk_done=on_chunk_done, failed_out=failed_symbols,
+                on_chunk_done=stream_cb, failed_out=failed_symbols,
             ):
                 if not chunk_df.is_empty():
                     _persist(chunk_df)
